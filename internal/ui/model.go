@@ -13,6 +13,7 @@ import (
 	"github.com/bagaspra16/lean-mac/internal/types"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/dustin/go-humanize"
 )
 
@@ -89,13 +90,26 @@ func tickEvery() tea.Cmd {
 func (v *scanView) Title() string {
 	switch v.phase {
 	case phaseScanning:
-		return "Scanning"
+		return "Scanning disk"
 	case phaseConfirm:
 		return "Confirm cleanup"
 	case phaseDone:
 		return "Cleanup complete"
 	default:
 		return "Findings"
+	}
+}
+
+func (v *scanView) Subtitle() string {
+	switch v.phase {
+	case phaseScanning:
+		return "discovering reclaimable artifacts"
+	case phaseConfirm:
+		return "review then approve or cancel"
+	case phaseDone:
+		return "summary of what changed"
+	default:
+		return "grouped by category, sorted by size"
 	}
 }
 
@@ -111,20 +125,27 @@ func (v *scanView) Status() string {
 	if v.dryRun {
 		tag = " · dry-run"
 	}
-	return fmt.Sprintf("reclaimable %s%s", humanize.IBytes(uint64(total)), tag)
+	return fmt.Sprintf("%d findings · reclaimable %s%s",
+		len(v.findings), humanize.IBytes(uint64(total)), tag)
 }
 
-func (v *scanView) Footer() string {
+func (v *scanView) Footer() []hint {
 	if v.searching {
-		return "/" + v.search + " · enter/esc done"
+		return []hint{{"enter/esc", "done"}}
 	}
 	switch v.phase {
 	case phaseConfirm:
-		return "y confirm · n cancel"
+		return []hint{{"y", "confirm"}, {"n", "cancel"}}
 	case phaseDone:
-		return "esc back to findings"
+		return []hint{{"esc", "back"}}
 	default:
-		return fmt.Sprintf("j/k move · space mark · a mark-safe · / search · d delete (%d marked)", v.countMarked())
+		return []hint{
+			{"j/k", "move"},
+			{"space", "mark"},
+			{"a", "mark all SAFE"},
+			{"/", "search"},
+			{"d", fmt.Sprintf("delete %d marked", v.countMarked())},
+		}
 	}
 }
 
@@ -301,26 +322,40 @@ func (v *scanView) visibleFindings() []types.Finding {
 }
 
 func (v *scanView) View(width, height int) string {
-	v.width, v.height = width, height+4 // map back to internal height for sizing helpers
+	v.width, v.height = width, height
+	body := ""
 	switch v.phase {
 	case phaseDone:
-		return v.viewDone()
+		body = v.viewDone()
 	case phaseConfirm:
-		return v.viewTable() + "\n\n" + v.viewConfirm()
+		body = v.viewTable() + "\n\n" + v.viewConfirm()
 	default:
-		return v.viewTable()
+		body = v.legendRow() + "\n" + v.viewTable()
 	}
+	return body
+}
+
+// legendRow renders an inline risk legend so a new user immediately learns
+// what the colored chips next to each row mean.
+func (v *scanView) legendRow() string {
+	parts := []string{
+		dimStyle.Render("risk:"),
+		riskChip("SAFE") + " " + dimStyle.Render("auto-regen"),
+		riskChip("MEDIUM") + " " + dimStyle.Render("rebuild needed"),
+		riskChip("DANGEROUS") + " " + dimStyle.Render("may lose data"),
+	}
+	return strings.Join(parts, "  ")
 }
 
 func (v *scanView) viewTable() string {
 	display := v.visibleFindings()
 	if len(display) == 0 {
 		if v.phase == phaseScanning {
-			return mutedStyle.Render("  scanning…")
+			return v.viewScanningEmpty()
 		}
 		return mutedStyle.Render("  no findings")
 	}
-	maxRows := v.height - 8
+	maxRows := v.height - 3 // legend row + breathing room
 	if maxRows < 5 {
 		maxRows = 5
 	}
@@ -331,19 +366,15 @@ func (v *scanView) viewTable() string {
 		catCounts[f.Category]++
 	}
 	start := 0
-	if v.cursor > maxRows-3 {
-		start = v.cursor - (maxRows - 3)
+	if v.cursor > maxRows-4 {
+		start = v.cursor - (maxRows - 4)
 	}
 	var rows []string
 	var lastCat types.Category
 	for i := start; i < len(display); i++ {
 		f := display[i]
 		if f.Category != lastCat {
-			rows = append(rows, fmt.Sprintf("▾ %s  %s  (%d items)",
-				headerStyle.Render(string(f.Category)),
-				mutedStyle.Render(humanize.IBytes(uint64(catTotals[f.Category]))),
-				catCounts[f.Category],
-			))
+			rows = append(rows, v.renderCategoryHeader(f.Category, catTotals[f.Category], catCounts[f.Category]))
 			lastCat = f.Category
 		}
 		rows = append(rows, v.renderRow(f, i == v.cursor))
@@ -354,46 +385,76 @@ func (v *scanView) viewTable() string {
 	return strings.Join(rows, "\n")
 }
 
+func (v *scanView) renderCategoryHeader(cat types.Category, total int64, count int) string {
+	head := fmt.Sprintf("▾ %s  %s  %s",
+		headerStyle.Render(string(cat)),
+		mutedStyle.Render(humanize.IBytes(uint64(total))),
+		subtleStyle.Render(fmt.Sprintf("(%d)", count)),
+	)
+	if blurb := categoryBlurb(cat); blurb != "" {
+		head += "\n  " + dimStyle.Render(blurb)
+	}
+	return head
+}
+
 func (v *scanView) renderRow(f types.Finding, selected bool) string {
-	marker := " "
+	marker := "  "
 	if v.marked[f.Path] {
-		marker = markedStyle.Render("●")
+		marker = markedStyle.Render("● ")
 	}
-	var risk string
-	switch f.Risk {
-	case types.RiskSafe:
-		risk = riskSafe.Render("SAFE  ")
-	case types.RiskMedium:
-		risk = riskMed.Render("MED   ")
-	case types.RiskDangerous:
-		risk = riskDang.Render("DANGER")
-	}
+	chip := riskChip(f.Risk.String())
 	size := humanize.IBytes(uint64(f.Size))
 	path := f.Path
-	maxPath := v.width - 30
+	maxPath := v.width - 32
 	if maxPath > 0 && len(path) > maxPath {
 		path = "…" + path[len(path)-maxPath+1:]
 	}
-	line := fmt.Sprintf(" %s %s %10s  %s", marker, risk, size, path)
+	line := fmt.Sprintf("   %s%s %10s  %s", marker, chip, size, path)
 	if selected {
 		return selectedRowStyle.Render(line)
 	}
 	return rowStyle.Render(line)
 }
 
+func (v *scanView) viewScanningEmpty() string {
+	spinner := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+	frame := spinner[(time.Now().UnixMilli()/100)%int64(len(spinner))]
+	dot := lipgloss.NewStyle().Foreground(colorAccent).Render(frame)
+	lines := []string{
+		"",
+		"  " + dot + "  " + headerStyle.Render("Scanning your home directory and known cache paths"),
+		"",
+		"  " + dimStyle.Render("This typically takes 10-30 seconds. Detectors run concurrently;"),
+		"  " + dimStyle.Render("findings stream in as they are discovered."),
+	}
+	return strings.Join(lines, "\n")
+}
+
 func (v *scanView) viewConfirm() string {
 	marked := v.markedFindings()
 	var total int64
+	risk := types.RiskSafe
 	for _, f := range marked {
 		total += f.Size
+		if f.Risk > risk {
+			risk = f.Risk
+		}
 	}
-	mode := "DELETE"
+	heading := riskChip(risk.String()) + "  " + headerStyle.Render("Confirm cleanup")
+	mode := "live · files will be deleted"
 	if v.dryRun {
-		mode = "DRY-RUN (nothing will be deleted)"
+		mode = "dry-run · nothing will be deleted"
 	}
-	body := fmt.Sprintf("%s\n\n%d items, %s reclaimable\n\n[y] confirm   [n] cancel",
-		mode, len(marked), humanize.IBytes(uint64(total)))
-	return modalStyle.Render(body)
+	lines := []string{
+		heading,
+		"",
+		fmt.Sprintf("%d items across this selection.", len(marked)),
+		fmt.Sprintf("Reclaimable: %s", headerStyle.Render(humanize.IBytes(uint64(total)))),
+		dimStyle.Render("Mode: " + mode),
+		"",
+		footerKeyStyle.Render("y") + " confirm    " + footerKeyStyle.Render("n") + " cancel",
+	}
+	return modalStyle.Render(strings.Join(lines, "\n"))
 }
 
 func (v *scanView) viewDone() string {

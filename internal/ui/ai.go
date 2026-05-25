@@ -69,10 +69,7 @@ func newAIView(client *ai.Client, dryRun bool) *aiView {
 			{Role: "system", Content: ai.SystemPrompt},
 		},
 	}
-	v.lines = []chatLine{
-		{role: "system", text: "AI Cleanse ready. Ask me to analyse your disk."},
-		{role: "system", text: "Try: \"What's eating my disk?\" or \"Help me free up 10GB safely.\""},
-	}
+	// no seed lines — the welcome card is rendered when there is no chat yet.
 	return v
 }
 
@@ -95,21 +92,36 @@ func waitAIEvent(ch chan ai.Event) tea.Cmd {
 func (v *aiView) Title() string {
 	switch v.state {
 	case aiDisabled:
-		return "AI Cleanse (disabled)"
+		return "AI Cleanse"
 	case aiThinking:
-		return "AI Cleanse · thinking…"
+		return "AI Cleanse"
 	case aiAwaitApproval:
-		return "AI Cleanse · awaiting approval"
+		return "AI Cleanse"
 	case aiExecuting:
-		return "AI Cleanse · executing"
+		return "AI Cleanse"
 	default:
 		return "AI Cleanse"
 	}
 }
 
+func (v *aiView) Subtitle() string {
+	switch v.state {
+	case aiDisabled:
+		return "not configured · see setup below"
+	case aiThinking:
+		return "thinking…"
+	case aiAwaitApproval:
+		return "awaiting your approval"
+	case aiExecuting:
+		return "executing approved action"
+	default:
+		return "conversational cleanup with per-action approval"
+	}
+}
+
 func (v *aiView) Status() string {
 	if v.state == aiDisabled {
-		return "no Groq key"
+		return "groq key required"
 	}
 	mode := "dry-run"
 	if !v.dryRun {
@@ -122,16 +134,25 @@ func (v *aiView) Status() string {
 	return mode + auto
 }
 
-func (v *aiView) Footer() string {
+func (v *aiView) Footer() []hint {
 	switch v.state {
 	case aiDisabled:
-		return "see ~/.config/lean-mac/config.toml"
+		return []hint{{"3", "open Help"}}
 	case aiAwaitApproval:
-		return "y approve · n reject · a auto-approve SAFE · c cancel"
+		return []hint{
+			{"y", "approve"},
+			{"n", "reject"},
+			{"a", "auto-approve SAFE"},
+			{"c", "cancel"},
+		}
 	case aiThinking, aiExecuting:
-		return "(working… ctrl+c to abort)"
+		return []hint{{"ctrl+c", "abort"}}
 	default:
-		return "type a message · enter send · ctrl+u clear"
+		return []hint{
+			{"type", "your question"},
+			{"enter", "send"},
+			{"ctrl+u", "clear input"},
+		}
 	}
 }
 
@@ -363,40 +384,92 @@ func (v *aiView) append(role, text string) {
 func (v *aiView) View(width, height int) string {
 	v.width, v.height = width, height
 	if v.state == aiDisabled {
-		return v.viewDisabled()
+		return v.viewDisabled(width, height)
 	}
-	// chat takes height - 3 (input box is 3 rows)
-	chatH := height - 3
+	chatH := height - 3 // input box is 3 rows tall
 	if chatH < 3 {
 		chatH = 3
 	}
-	chat := v.renderChat(width, chatH)
-	input := v.renderInput(width)
-	return chat + "\n" + input
+	var body string
+	if len(v.lines) == 0 {
+		body = v.viewWelcome(width, chatH)
+	} else {
+		body = v.renderChat(width, chatH)
+	}
+	return body + "\n" + v.renderInput(width)
 }
 
-func (v *aiView) viewDisabled() string {
-	return strings.Join([]string{
+// viewWelcome renders a card-style splash when no conversation has started.
+func (v *aiView) viewWelcome(width, height int) string {
+	cardWidth := width - 4
+	if cardWidth > 88 {
+		cardWidth = 88
+	}
+	lines := []string{
+		panelTitleStyle.Render("Welcome to AI Cleanse"),
 		"",
-		"  " + riskMed.Render("AI Cleanse is disabled."),
+		panelDescStyle.Render("Ask in plain English. I'll scan your disk, explain what's"),
+		panelDescStyle.Render("eating space, and propose deletions one category at a time."),
+		panelDescStyle.Render("You approve each step — nothing is removed without your y."),
 		"",
-		"  To enable, supply a Groq API key by either:",
+		sectionStyle.Render("Try one of these"),
+		"  " + chipStyle.Render("What's eating my disk?"),
+		"  " + chipStyle.Render("Free up 10 GB safely"),
+		"  " + chipStyle.Render("Show me only Docker cleanup"),
+		"  " + chipStyle.Render("Be aggressive — I haven't touched these in months"),
 		"",
-		"    " + headerStyle.Render("Environment variable") + "  (one or more, rotated on rate-limit)",
-		"      export GROQ_API_KEY=...",
-		"      export GROQ_API_KEY_2=...",
+		sectionStyle.Render("How approval works"),
+		"  " + riskChip("SAFE") + "  " + dimStyle.Render(riskBlurb("SAFE")),
+		"  " + riskChip("MEDIUM") + "  " + dimStyle.Render(riskBlurb("MEDIUM")),
+		"  " + riskChip("DANGEROUS") + "  " + dimStyle.Render(riskBlurb("DANGEROUS")),
 		"",
-		"    " + headerStyle.Render("Config file") + "",
-		"      mkdir -p ~/.config/lean-mac",
-		"      cat > ~/.config/lean-mac/config.toml <<EOF",
-		"      groq_api_key   = \"gsk_...\"",
-		"      groq_api_key_2 = \"gsk_...\"",
-		"      model          = \"llama-3.3-70b-versatile\"",
-		"      EOF",
+		dimStyle.Render("Dry-run is on by default. Press " + footerKeyStyle.Render("a") + " during a SAFE proposal to auto-approve the rest."),
+	}
+	card := cardStyle.Width(cardWidth).Render(strings.Join(lines, "\n"))
+	// pad above to vertically center
+	cardH := strings.Count(card, "\n") + 1
+	pad := (height - cardH) / 2
+	if pad < 0 {
+		pad = 0
+	}
+	return strings.Repeat("\n", pad) + lipgloss.PlaceHorizontal(width, lipgloss.Center, card)
+}
+
+func (v *aiView) viewDisabled(width, height int) string {
+	cardWidth := width - 4
+	if cardWidth > 88 {
+		cardWidth = 88
+	}
+	lines := []string{
+		panelTitleStyle.Render("AI Cleanse — set up in two steps"),
 		"",
-		"  Then restart lm.  Get keys at " + headerStyle.Render("https://console.groq.com/keys"),
+		panelDescStyle.Render("AI Cleanse uses Groq's free LLM tier. You bring your own key,"),
+		panelDescStyle.Render("which stays on your machine. Nothing is sent except the key"),
+		panelDescStyle.Render("and the scan summary you explicitly ask it to analyse."),
 		"",
-	}, "\n")
+		sectionStyle.Render("1. Get a free Groq API key"),
+		"  " + dimStyle.Render("Open ") + headerStyle.Render("https://console.groq.com/keys"),
+		"  " + dimStyle.Render("Sign in, click ") + headerStyle.Render("Create API Key") + dimStyle.Render(", copy the value (starts with gsk_)."),
+		"",
+		sectionStyle.Render("2. Save it where lm can find it"),
+		"  " + dimStyle.Render("Run in your shell:"),
+		"",
+		"    " + footerKeyStyle.Render("mkdir -p ~/.config/lean-mac"),
+		"    " + footerKeyStyle.Render("cat > ~/.config/lean-mac/config.toml <<EOF"),
+		"    " + footerKeyStyle.Render("groq_api_key = \"gsk_paste_yours_here\""),
+		"    " + footerKeyStyle.Render("EOF"),
+		"    " + footerKeyStyle.Render("chmod 600 ~/.config/lean-mac/config.toml"),
+		"",
+		dimStyle.Render("Then quit lm (q) and start again. The rest of lm (Scan, monitor,"),
+		dimStyle.Render("doctor) works without any key."),
+	}
+	card := cardStyle.Width(cardWidth).Render(strings.Join(lines, "\n"))
+	cardH := strings.Count(card, "\n") + 1
+	pad := (height - cardH) / 2
+	if pad < 0 {
+		pad = 0
+	}
+	return strings.Repeat("\n", pad) + lipgloss.PlaceHorizontal(width, lipgloss.Center, card)
 }
 
 func (v *aiView) renderChat(width, height int) string {
