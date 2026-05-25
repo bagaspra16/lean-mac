@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/bagaspra16/lean-mac/internal/ai"
 	"github.com/bagaspra16/lean-mac/internal/types"
@@ -17,16 +18,33 @@ import (
 type aiState int
 
 const (
-	aiIdle           aiState = iota // waiting for user input
-	aiThinking                       // request in flight
-	aiAwaitApproval                  // proposal shown, waiting on y/n/a/c
-	aiExecuting                      // running an approved action
-	aiDisabled                       // no keys
+	aiIdle          aiState = iota // waiting for user input
+	aiThinking                     // request in flight
+	aiAwaitApproval                // proposal shown, waiting on y/n/a/c
+	aiExecuting                    // running an approved action
+	aiDisabled                     // no keys
+)
+
+// chatLineKind controls how a line is rendered.
+type chatLineKind int
+
+const (
+	kindUser      chatLineKind = iota
+	kindAssistant              // AI text response
+	kindThinking               // "AI is thinking" step indicator
+	kindTool                   // tool call event
+	kindScan                   // scan progress/done
+	kindExec                   // execution result
+	kindSystem                 // generic system notice
+	kindDone                   // success result
+	kindError                  // error
+	kindProposal               // approval request
 )
 
 // chatLine is one entry in the scrollback.
 type chatLine struct {
-	role string // "user" | "assistant" | "system" | "tool"
+	kind chatLineKind
+	role string // legacy "user"|"assistant"|"system"|"tool"
 	text string
 }
 
@@ -55,6 +73,7 @@ type aiView struct {
 	events chan ai.Event
 	cancel context.CancelFunc
 
+	scrollOffset int // manual scroll in approval view
 	width, height int
 }
 
@@ -69,7 +88,6 @@ func newAIView(client *ai.Client, dryRun bool) *aiView {
 			{Role: "system", Content: ai.SystemPrompt},
 		},
 	}
-	// no seed lines — the welcome card is rendered when there is no chat yet.
 	return v
 }
 
@@ -89,33 +107,20 @@ func waitAIEvent(ch chan ai.Event) tea.Cmd {
 	}
 }
 
-func (v *aiView) Title() string {
-	switch v.state {
-	case aiDisabled:
-		return "AI Cleanse"
-	case aiThinking:
-		return "AI Cleanse"
-	case aiAwaitApproval:
-		return "AI Cleanse"
-	case aiExecuting:
-		return "AI Cleanse"
-	default:
-		return "AI Cleanse"
-	}
-}
+func (v *aiView) Title() string { return "AI Cleanse" }
 
 func (v *aiView) Subtitle() string {
 	switch v.state {
 	case aiDisabled:
 		return "not configured · see setup below"
 	case aiThinking:
-		return "thinking…"
+		return "⠿ thinking…"
 	case aiAwaitApproval:
-		return "awaiting your approval"
+		return "⚡ awaiting your approval"
 	case aiExecuting:
-		return "executing approved action"
+		return "⚙ executing approved action"
 	default:
-		return "conversational cleanup with per-action approval"
+		return "conversational cleanup · per-action approval"
 	}
 }
 
@@ -140,10 +145,10 @@ func (v *aiView) Footer() []hint {
 		return []hint{{"3", "open Help"}}
 	case aiAwaitApproval:
 		return []hint{
-			{"y", "approve"},
-			{"n", "reject"},
+			{"y", "approve & execute"},
+			{"n", "reject & skip"},
 			{"a", "auto-approve SAFE"},
-			{"c", "cancel"},
+			{"c", "cancel session"},
 		}
 	case aiThinking, aiExecuting:
 		return []hint{{"ctrl+c", "abort"}}
@@ -157,19 +162,16 @@ func (v *aiView) Footer() []hint {
 }
 
 // wantsKey lets the App route keystrokes here while the input is focused.
-// Globals (tab, q) should still work when we're idle and the input is empty,
-// or when we're in approval/exec state.
 func (v *aiView) wantsKey(msg tea.KeyMsg) bool {
 	if v.state == aiDisabled {
 		return false
 	}
 	if v.state == aiAwaitApproval {
-		return false // let global keys (tab) work; approval uses single letters
+		return false
 	}
 	if v.state == aiThinking || v.state == aiExecuting {
 		return false
 	}
-	// idle: capture printable runes + edit keys so typing doesn't hit globals.
 	switch msg.Type {
 	case tea.KeyRunes, tea.KeySpace, tea.KeyBackspace, tea.KeyEnter, tea.KeyCtrlU:
 		return true
@@ -186,20 +188,16 @@ func (v *aiView) Update(msg tea.Msg) (view, tea.Cmd) {
 		return v.onEvent(m.ev)
 	case aiTurnDoneMsg:
 		if m.err != nil {
-			v.append("system", "error: "+m.err.Error())
+			v.appendKind(kindError, "error: "+m.err.Error())
 			v.state = aiIdle
 		}
 		v.convo = m.msgs
-		// State transitions are driven by events (EvtProposal → awaiting,
-		// EvtError → idle). If after the turn we're still in aiThinking with no
-		// pending proposal, the model just chatted — return to idle.
 		if v.state == aiThinking && v.pending == nil {
 			v.state = aiIdle
 		}
 		return v, waitAIEvent(v.events)
 	case aiExecDoneMsg:
-		v.append("system", fmt.Sprintf("✓ done. freed %s.", humanize.IBytes(uint64(m.freed))))
-		// feed result back to model
+		v.appendKind(kindDone, fmt.Sprintf("✓ Done — freed %s.", humanize.IBytes(uint64(m.freed))))
 		v.convo = append(v.convo, ai.FeedbackForModel(v.pending, true, m.freed))
 		approved := v.pending
 		v.pending = nil
@@ -218,43 +216,54 @@ func (v *aiView) onEvent(ev ai.Event) (view, tea.Cmd) {
 	switch ev.Kind {
 	case ai.EvtThinking:
 		v.state = aiThinking
+		v.appendKind(kindThinking, "AI is processing your request…")
 	case ai.EvtAssistant:
-		v.append("assistant", ev.Text)
+		// Remove last thinking line if present
+		if len(v.lines) > 0 && v.lines[len(v.lines)-1].kind == kindThinking {
+			v.lines = v.lines[:len(v.lines)-1]
+		}
+		v.appendKind(kindAssistant, ev.Text)
 	case ai.EvtScanStart:
-		v.append("system", "scanning disk…")
+		v.appendKind(kindScan, "🔍 Scanning disk — discovering reclaimable artifacts…")
 	case ai.EvtScanDone:
 		if ev.Report != nil {
-			v.append("system", fmt.Sprintf("scan done · %d findings · %s reclaimable",
+			v.appendKind(kindScan, fmt.Sprintf(
+				"✓ Scan complete — %d findings · %s reclaimable · %s free of %s",
 				len(ev.Report.Findings),
-				humanize.IBytes(uint64(ev.Report.TotalBytes))))
+				humanize.IBytes(uint64(ev.Report.TotalBytes)),
+				humanize.IBytes(uint64(ev.Report.DiskFree)),
+				humanize.IBytes(uint64(ev.Report.DiskTotal)),
+			))
 		}
 	case ai.EvtProposal:
 		v.pending = ev.Action
 		v.state = aiAwaitApproval
-		v.append("system", v.renderProposal(ev.Action))
+		v.scrollOffset = 0
+		// Don't add a chatLine for proposal — it renders as the approval panel
 		if v.autoSafe && ev.Action.Risk == types.RiskSafe {
 			return v, v.approve()
 		}
+	case ai.EvtExecutionStart:
+		if ev.Action != nil {
+			v.appendKind(kindExec, fmt.Sprintf("⚙ Executing: %s (%d items)…",
+				ev.Action.Category, len(ev.Action.Findings)))
+		}
+	case ai.EvtExecutionResult:
+		if ev.Result != nil {
+			if ev.Result.Success {
+				v.appendKind(kindDone, fmt.Sprintf("  ✓ %s  %s",
+					ev.Result.Finding.Path,
+					humanize.IBytes(uint64(ev.Result.BytesFreed))))
+			} else {
+				v.appendKind(kindError, fmt.Sprintf("  ✗ %s  %s",
+					ev.Result.Finding.Path, ev.Result.Error))
+			}
+		}
 	case ai.EvtError:
-		v.append("system", "error: "+ev.Err.Error())
+		v.appendKind(kindError, "✗ Error: "+ev.Err.Error())
 		v.state = aiIdle
 	}
 	return v, waitAIEvent(v.events)
-}
-
-func (v *aiView) renderProposal(a *ai.Action) string {
-	risk := riskStyle(a.Risk.String()).Render("[" + a.Risk.String() + "]")
-	header := fmt.Sprintf("%s proposal: remove %s (%d items, %s)",
-		risk, a.Category, len(a.Findings), humanize.IBytes(uint64(a.Total)))
-	preview := []string{header, "  " + a.Reason}
-	for i, f := range a.Findings {
-		if i >= 3 {
-			preview = append(preview, fmt.Sprintf("  · and %d more…", len(a.Findings)-3))
-			break
-		}
-		preview = append(preview, fmt.Sprintf("  · %s (%s)", f.Path, humanize.IBytes(uint64(f.Size))))
-	}
-	return strings.Join(preview, "\n")
 }
 
 func (v *aiView) onKey(msg tea.KeyMsg) (view, tea.Cmd) {
@@ -266,7 +275,7 @@ func (v *aiView) onKey(msg tea.KeyMsg) (view, tea.Cmd) {
 			return v, v.reject()
 		case "a":
 			v.autoSafe = true
-			v.append("system", "auto-approve SAFE proposals enabled.")
+			v.appendKind(kindSystem, "Auto-approve SAFE proposals enabled.")
 			if v.pending != nil && v.pending.Risk == types.RiskSafe {
 				return v, v.approve()
 			}
@@ -292,7 +301,7 @@ func (v *aiView) onKey(msg tea.KeyMsg) (view, tea.Cmd) {
 			return v, nil
 		}
 		v.input = ""
-		v.append("user", text)
+		v.appendKind(kindUser, text)
 		v.convo = append(v.convo, ai.Message{Role: "user", Content: text})
 		v.state = aiThinking
 		return v, tea.Batch(v.runTurn(), waitAIEvent(v.events))
@@ -316,16 +325,11 @@ func (v *aiView) approve() tea.Cmd {
 		return nil
 	}
 	v.state = aiExecuting
-	v.append("system", fmt.Sprintf("approved · executing %s…", action.Category))
+	v.appendKind(kindSystem, fmt.Sprintf("✔ Approved — executing %s…", action.Category))
 	dry := v.dryRun
 	events := v.events
 	return func() tea.Msg {
-		// stream execution events into v.events for live feedback
 		ai.Execute(context.Background(), action, dry, events)
-		// Execute doesn't emit a freed-total; sum from action since cleaner returns
-		// per-result bytes via events. For simplicity we trust action.Total here
-		// (in dry-run that's exact; live runs may have partial successes — those
-		// show as individual ✗ events to the user).
 		return aiExecDoneMsg{freed: action.Total}
 	}
 }
@@ -333,7 +337,7 @@ func (v *aiView) approve() tea.Cmd {
 func (v *aiView) reject() tea.Cmd {
 	action := v.pending
 	v.pending = nil
-	v.append("system", fmt.Sprintf("declined · skipping %s.", action.Category))
+	v.appendKind(kindSystem, fmt.Sprintf("✖ Rejected — skipping %s.", action.Category))
 	v.convo = append(v.convo, ai.FeedbackForModel(action, false, 0))
 	v.state = aiThinking
 	return tea.Batch(v.runTurn(), waitAIEvent(v.events))
@@ -345,13 +349,10 @@ func (v *aiView) cancelAgent() tea.Cmd {
 	}
 	v.pending = nil
 	v.state = aiIdle
-	v.append("system", "cancelled.")
+	v.appendKind(kindSystem, "Session cancelled.")
 	return nil
 }
 
-// runTurn fires one agent step. It loops internally if the model returns tool
-// calls but no proposal (e.g. scan_disk then immediate follow-up), so the user
-// always sees either an assistant text or a proposal.
 func (v *aiView) runTurn() tea.Cmd {
 	convo := v.convo
 	agent := v.agent
@@ -360,7 +361,6 @@ func (v *aiView) runTurn() tea.Cmd {
 	v.cancel = cancel
 	return func() tea.Msg {
 		defer cancel()
-		// up to 4 chained tool turns per user message
 		for i := 0; i < 4; i++ {
 			next, err := agent.Step(ctx, convo, events)
 			if err != nil {
@@ -369,7 +369,7 @@ func (v *aiView) runTurn() tea.Cmd {
 			convo = next
 			last := convo[len(convo)-1]
 			if last.Role == "tool" {
-				continue // model called a tool; loop to let it reply
+				continue
 			}
 			break
 		}
@@ -377,8 +377,8 @@ func (v *aiView) runTurn() tea.Cmd {
 	}
 }
 
-func (v *aiView) append(role, text string) {
-	v.lines = append(v.lines, chatLine{role: role, text: text})
+func (v *aiView) appendKind(kind chatLineKind, text string) {
+	v.lines = append(v.lines, chatLine{kind: kind, text: text})
 }
 
 func (v *aiView) View(width, height int) string {
@@ -386,17 +386,28 @@ func (v *aiView) View(width, height int) string {
 	if v.state == aiDisabled {
 		return v.viewDisabled(width, height)
 	}
-	chatH := height - 3 // input box is 3 rows tall
-	if chatH < 3 {
-		chatH = 3
+	// Reserve space: input box (3 rows) + approval panel if pending
+	inputH := 3
+	approvalH := 0
+	if v.state == aiAwaitApproval && v.pending != nil {
+		approvalH = v.approvalPanelHeight()
 	}
-	var body string
+	chatH := height - inputH - approvalH
+	if chatH < 2 {
+		chatH = 2
+	}
+
+	var sections []string
 	if len(v.lines) == 0 {
-		body = v.viewWelcome(width, chatH)
+		sections = append(sections, v.viewWelcome(width, chatH))
 	} else {
-		body = v.renderChat(width, chatH)
+		sections = append(sections, v.renderChat(width, chatH))
 	}
-	return body + "\n" + v.renderInput(width)
+	if v.state == aiAwaitApproval && v.pending != nil {
+		sections = append(sections, v.renderApprovalPanel(width))
+	}
+	sections = append(sections, v.renderInput(width))
+	return strings.Join(sections, "\n")
 }
 
 // viewWelcome renders a card-style splash when no conversation has started.
@@ -406,7 +417,7 @@ func (v *aiView) viewWelcome(width, height int) string {
 		cardWidth = 88
 	}
 	lines := []string{
-		panelTitleStyle.Render("Welcome to AI Cleanse"),
+		panelTitleStyle.Render("✦ Welcome to AI Cleanse"),
 		"",
 		panelDescStyle.Render("Ask in plain English. I'll scan your disk, explain what's"),
 		panelDescStyle.Render("eating space, and propose deletions one category at a time."),
@@ -418,15 +429,21 @@ func (v *aiView) viewWelcome(width, height int) string {
 		"  " + chipStyle.Render("Show me only Docker cleanup"),
 		"  " + chipStyle.Render("Be aggressive — I haven't touched these in months"),
 		"",
-		sectionStyle.Render("How approval works"),
+		sectionStyle.Render("How the AI process works"),
+		"  " + thinkBadgeStyle.Render(" THINK ") + "  " + dimStyle.Render("AI analyses your request"),
+		"  " + toolBadgeStyle.Render(" SCAN  ") + "  " + dimStyle.Render("Disk is scanned for artifacts"),
+		"  " + scanBadgeStyle.Render(" PROP  ") + "  " + dimStyle.Render("AI proposes a cleanup category"),
+		"  " + execBadgeStyle.Render(" EXEC  ") + "  " + dimStyle.Render("Files removed after your approval"),
+		"  " + doneBadgeStyle.Render(" DONE  ") + "  " + dimStyle.Render("Result reported back to AI"),
+		"",
+		sectionStyle.Render("Risk levels"),
 		"  " + riskChip("SAFE") + "  " + dimStyle.Render(riskBlurb("SAFE")),
 		"  " + riskChip("MEDIUM") + "  " + dimStyle.Render(riskBlurb("MEDIUM")),
 		"  " + riskChip("DANGEROUS") + "  " + dimStyle.Render(riskBlurb("DANGEROUS")),
 		"",
-		dimStyle.Render("Dry-run is on by default. Press " + footerKeyStyle.Render("a") + " during a SAFE proposal to auto-approve the rest."),
+		dimStyle.Render("Dry-run is ON by default. Press " + footerKeyStyle.Render("a") + " during a SAFE proposal to auto-approve all SAFE steps."),
 	}
 	card := cardStyle.Width(cardWidth).Render(strings.Join(lines, "\n"))
-	// pad above to vertically center
 	cardH := strings.Count(card, "\n") + 1
 	pad := (height - cardH) / 2
 	if pad < 0 {
@@ -473,7 +490,6 @@ func (v *aiView) viewDisabled(width, height int) string {
 }
 
 func (v *aiView) renderChat(width, height int) string {
-	// flatten lines into wrapped strings, then keep the last `height` rows.
 	var rendered []string
 	for _, ln := range v.lines {
 		rendered = append(rendered, v.formatLine(ln, width)...)
@@ -489,23 +505,34 @@ func (v *aiView) renderChat(width, height int) string {
 
 func (v *aiView) formatLine(ln chatLine, width int) []string {
 	var badge string
-	var prefix string
-	switch ln.role {
-	case "user":
+	switch ln.kind {
+	case kindUser:
 		badge = userBadgeStyle.Render(" you ")
-	case "assistant":
-		badge = aiBadgeStyle.Render(" ai ")
+	case kindAssistant:
+		badge = aiBadgeStyle.Render(" ai  ")
+	case kindThinking:
+		spinner := thinkingSpinner()
+		badge = thinkBadgeStyle.Render(" " + spinner + " ")
+	case kindTool:
+		badge = toolBadgeStyle.Render(" tool")
+	case kindScan:
+		badge = scanBadgeStyle.Render(" scan")
+	case kindExec:
+		badge = execBadgeStyle.Render(" exec")
+	case kindDone:
+		badge = doneBadgeStyle.Render(" done")
+	case kindError:
+		badge = errorBadgeStyle.Render(" err ")
 	default:
 		badge = systemBadgeStyle.Render("·")
 	}
-	prefix = badge + " "
+	prefix := badge + " "
 	indent := strings.Repeat(" ", lipgloss.Width(prefix))
-	body := ln.text
 	maxWidth := width - lipgloss.Width(prefix) - 2
 	if maxWidth < 20 {
 		maxWidth = 20
 	}
-	wrapped := wrap(body, maxWidth)
+	wrapped := wrap(ln.text, maxWidth)
 	out := make([]string, 0, len(wrapped))
 	for i, w := range wrapped {
 		if i == 0 {
@@ -517,18 +544,126 @@ func (v *aiView) formatLine(ln chatLine, width int) []string {
 	return out
 }
 
+// approvalPanelHeight estimates the number of rows the approval panel will occupy.
+func (v *aiView) approvalPanelHeight() int {
+	if v.pending == nil {
+		return 0
+	}
+	base := 10 // heading + risk + reason + items + action row + borders
+	n := len(v.pending.Findings)
+	if n > 5 {
+		n = 5
+	}
+	return base + n
+}
+
+// renderApprovalPanel draws a rich, bordered approval dialog.
+func (v *aiView) renderApprovalPanel(width int) string {
+	a := v.pending
+	if a == nil {
+		return ""
+	}
+	risk := a.Risk.String()
+	boxW := width - 6
+	if boxW > 90 {
+		boxW = 90
+	}
+
+	// Header line
+	header := riskChip(risk) + "  " +
+		lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render("Cleanup Proposal") +
+		"  " + dimStyle.Render(string(a.Category))
+
+	// Size / count summary
+	summary := fmt.Sprintf("%s reclaimable across %d item(s)",
+		lipgloss.NewStyle().Foreground(colorAccent2).Bold(true).Render(humanize.IBytes(uint64(a.Total))),
+		len(a.Findings))
+
+	// Reason
+	reasonLines := wrap(a.Reason, boxW-4)
+	var reasonParts []string
+	for _, rl := range reasonLines {
+		reasonParts = append(reasonParts, "  "+dimStyle.Render(rl))
+	}
+
+	// File list (up to 5)
+	var fileLines []string
+	for i, f := range a.Findings {
+		if i >= 5 {
+			fileLines = append(fileLines, "  "+subtleStyle.Render(fmt.Sprintf("… and %d more", len(a.Findings)-5)))
+			break
+		}
+		chip := riskChip(f.Risk.String())
+		sz := mutedStyle.Render(fmt.Sprintf("%10s", humanize.IBytes(uint64(f.Size))))
+		p := f.Path
+		maxP := boxW - 28
+		if maxP > 0 && len(p) > maxP {
+			p = "…" + p[len(p)-maxP+1:]
+		}
+		fileLines = append(fileLines, fmt.Sprintf("  %s %s  %s", chip, sz, p))
+	}
+
+	// Action row
+	modeTag := "DRY-RUN — no files will be deleted"
+	if !v.dryRun {
+		modeTag = "LIVE — files will be permanently deleted"
+	}
+	modeStr := dimStyle.Render("Mode: " + modeTag)
+
+	actionRow := approveKeyStyle.Render(" y ") + " approve & execute   " +
+		rejectKeyStyle.Render(" n ") + " reject & skip   " +
+		autoKeyStyle.Render(" a ") + " auto-approve SAFE   " +
+		cancelKeyStyle.Render(" c ") + " cancel"
+
+	bodyLines := []string{
+		header,
+		"",
+		summary,
+		"",
+	}
+	bodyLines = append(bodyLines, reasonParts...)
+	bodyLines = append(bodyLines, "")
+	bodyLines = append(bodyLines, fileLines...)
+	bodyLines = append(bodyLines, "")
+	bodyLines = append(bodyLines, modeStr)
+	bodyLines = append(bodyLines, "")
+	bodyLines = append(bodyLines, actionRow)
+
+	box := approvalBoxForRisk(risk).Width(boxW).Render(strings.Join(bodyLines, "\n"))
+	return lipgloss.PlaceHorizontal(width, lipgloss.Center, box)
+}
+
 func (v *aiView) renderInput(width int) string {
 	prompt := "› "
 	cursor := "█"
-	if v.state == aiThinking || v.state == aiExecuting {
+	placeholder := ""
+	if v.state == aiThinking {
 		cursor = " "
+		placeholder = dimStyle.Render("AI is thinking…")
+	} else if v.state == aiExecuting {
+		cursor = " "
+		placeholder = dimStyle.Render("Executing…")
+	} else if v.state == aiAwaitApproval {
+		cursor = " "
+		placeholder = dimStyle.Render("Waiting for your approval above ↑")
 	}
-	body := prompt + v.input + cursor
+	var body string
+	if placeholder != "" && v.input == "" {
+		body = prompt + placeholder
+	} else {
+		body = prompt + v.input + cursor
+	}
 	style := inputBoxStyle
 	if v.state == aiIdle {
 		style = inputActiveStyle
 	}
 	return style.Width(width - 2).Render(body)
+}
+
+// thinkingSpinner returns a single spinner frame based on current time.
+func thinkingSpinner() string {
+	frames := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+	return frames[(time.Now().UnixMilli()/120)%int64(len(frames))]
 }
 
 // wrap splits s into lines no longer than width, preserving existing newlines.

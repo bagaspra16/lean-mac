@@ -32,6 +32,12 @@ type scanDoneMsg struct{ report *types.ScanReport }
 type cleanDoneMsg struct{ report *types.CleanReport }
 type tickMsg time.Time
 
+// statusNotice is a transient one-line status shown below the legend.
+type statusNotice struct {
+	text    string
+	expires time.Time
+}
+
 // scanView is the Scan tab. Compatible with the `view` interface.
 type scanView struct {
 	scn         *scanner.Scanner
@@ -41,6 +47,7 @@ type scanView struct {
 	findings    []types.Finding
 	marked      map[string]bool
 	cursor      int
+	scroll      int // top row of visible window
 	width       int
 	height      int
 	phase       phase
@@ -51,6 +58,7 @@ type scanView struct {
 	startedAt   time.Time
 	dryRun      bool
 	scanDone    chan *types.ScanReport
+	notice      *statusNotice
 }
 
 func newScanView(dryRun bool) *scanView {
@@ -109,7 +117,10 @@ func (v *scanView) Subtitle() string {
 	case phaseDone:
 		return "summary of what changed"
 	default:
-		return "grouped by category, sorted by size"
+		if v.searching || v.search != "" {
+			return fmt.Sprintf("searching for \"%s\"", v.search)
+		}
+		return "grouped by category · sorted by size"
 	}
 }
 
@@ -125,28 +136,50 @@ func (v *scanView) Status() string {
 	if v.dryRun {
 		tag = " · dry-run"
 	}
-	return fmt.Sprintf("%d findings · reclaimable %s%s",
-		len(v.findings), humanize.IBytes(uint64(total)), tag)
+	marked := v.countMarked()
+	markedTag := ""
+	if marked > 0 {
+		var ms int64
+		for _, f := range v.findings {
+			if v.marked[f.Path] {
+				ms += f.Size
+			}
+		}
+		markedTag = fmt.Sprintf(" · %d marked (%s)", marked, humanize.IBytes(uint64(ms)))
+	}
+	return fmt.Sprintf("%d findings · %s reclaimable%s%s",
+		len(v.findings), humanize.IBytes(uint64(total)), tag, markedTag)
 }
 
 func (v *scanView) Footer() []hint {
 	if v.searching {
-		return []hint{{"enter/esc", "done"}}
+		return []hint{
+			{"type", "filter text"},
+			{"enter/esc", "exit search"},
+			{"backspace", "delete char"},
+		}
 	}
 	switch v.phase {
 	case phaseConfirm:
-		return []hint{{"y", "confirm"}, {"n", "cancel"}}
+		return []hint{{"y", "confirm delete"}, {"n/esc", "cancel"}}
 	case phaseDone:
-		return []hint{{"esc", "back"}}
+		return []hint{{"esc", "back to list"}}
+	case phaseScanning:
+		return []hint{{"scanning…", ""}}
 	default:
 		return []hint{
-			{"j/k", "move"},
-			{"space", "mark"},
+			{"j/k ↑↓", "navigate"},
+			{"space", "mark/unmark"},
 			{"a", "mark all SAFE"},
+			{"A", "unmark all"},
 			{"/", "search"},
 			{"d", fmt.Sprintf("delete %d marked", v.countMarked())},
 		}
 	}
+}
+
+func (v *scanView) setNotice(text string) {
+	v.notice = &statusNotice{text: text, expires: time.Now().Add(2 * time.Second)}
 }
 
 func (v *scanView) Update(msg tea.Msg) (view, tea.Cmd) {
@@ -155,7 +188,14 @@ func (v *scanView) Update(msg tea.Msg) (view, tea.Cmd) {
 		v.width, v.height = msg.Width, msg.Height
 		return v, nil
 	case tickMsg:
+		// expire notice
+		if v.notice != nil && time.Now().After(v.notice.expires) {
+			v.notice = nil
+		}
 		if v.phase == phaseScanning {
+			return v, tickEvery()
+		}
+		if v.notice != nil {
 			return v, tickEvery()
 		}
 		return v, nil
@@ -188,52 +228,108 @@ func (v *scanView) updateSearch(msg tea.KeyMsg) (view, tea.Cmd) {
 	switch msg.Type {
 	case tea.KeyEnter, tea.KeyEsc:
 		v.searching = false
+		if v.search == "" {
+			v.setNotice("Search cleared — showing all findings")
+		}
 	case tea.KeyBackspace:
 		if len(v.search) > 0 {
 			v.search = v.search[:len(v.search)-1]
 		}
 	case tea.KeyRunes:
 		v.search += string(msg.Runes)
+		v.cursor = 0
+		v.scroll = 0
 	}
 	return v, nil
 }
 
 func (v *scanView) updateKey(msg tea.KeyMsg) (view, tea.Cmd) {
 	visible := v.visibleFindings()
+	maxRows := v.maxVisibleRows()
 	switch msg.String() {
 	case "j", "down":
 		if v.cursor < len(visible)-1 {
 			v.cursor++
+			// scroll window down if cursor moves past bottom
+			if v.cursor >= v.scroll+maxRows {
+				v.scroll = v.cursor - maxRows + 1
+			}
 		}
 	case "k", "up":
 		if v.cursor > 0 {
 			v.cursor--
+			// scroll window up if cursor moves past top
+			if v.cursor < v.scroll {
+				v.scroll = v.cursor
+			}
 		}
 	case "g":
 		v.cursor = 0
+		v.scroll = 0
+		v.setNotice("Jumped to top")
 	case "G":
 		if len(visible) > 0 {
 			v.cursor = len(visible) - 1
+			v.scroll = max(0, v.cursor-maxRows+1)
+			v.setNotice("Jumped to bottom")
+		}
+	case "ctrl+d":
+		v.cursor = min(v.cursor+maxRows/2, len(visible)-1)
+		v.scroll = max(0, v.cursor-maxRows+1)
+	case "ctrl+u":
+		v.cursor = max(0, v.cursor-maxRows/2)
+		if v.cursor < v.scroll {
+			v.scroll = v.cursor
 		}
 	case " ":
 		if v.cursor < len(visible) {
 			f := visible[v.cursor]
-			v.marked[f.Path] = !v.marked[f.Path]
+			if v.marked[f.Path] {
+				v.marked[f.Path] = false
+				v.setNotice(fmt.Sprintf("Unmarked: %s (%s)", shortPath(f.Path), humanize.IBytes(uint64(f.Size))))
+			} else {
+				v.marked[f.Path] = true
+				v.setNotice(fmt.Sprintf("Marked for deletion: %s (%s)", shortPath(f.Path), humanize.IBytes(uint64(f.Size))))
+			}
 		}
 	case "a":
+		n := 0
 		for _, f := range visible {
-			if f.Risk == types.RiskSafe {
+			if f.Risk == types.RiskSafe && !v.marked[f.Path] {
 				v.marked[f.Path] = true
+				n++
 			}
+		}
+		if n > 0 {
+			v.setNotice(fmt.Sprintf("Marked %d SAFE item(s) for deletion", n))
+		} else {
+			v.setNotice("All SAFE items already marked")
+		}
+	case "A":
+		n := 0
+		for k, ok := range v.marked {
+			if ok {
+				v.marked[k] = false
+				n++
+			}
+		}
+		if n > 0 {
+			v.setNotice(fmt.Sprintf("Unmarked all — cleared %d item(s)", n))
+		} else {
+			v.setNotice("Nothing was marked")
 		}
 	case "/":
 		if v.phase == phaseReady {
 			v.searching = true
 			v.search = ""
+			v.cursor = 0
+			v.scroll = 0
 		}
 	case "d":
 		if v.phase == phaseReady && v.countMarked() > 0 {
 			v.phase = phaseConfirm
+		} else if v.phase == phaseReady {
+			v.setNotice("Nothing marked — press space to mark items, then d to delete")
 		}
 	case "y":
 		if v.phase == phaseConfirm {
@@ -242,10 +338,12 @@ func (v *scanView) updateKey(msg tea.KeyMsg) (view, tea.Cmd) {
 	case "n", "esc":
 		if v.phase == phaseConfirm {
 			v.phase = phaseReady
+			v.setNotice("Delete cancelled — items remain marked")
 		} else if v.phase == phaseDone {
 			v.phase = phaseReady
 			v.cleanReport = nil
 			v.marked = map[string]bool{}
+			v.setNotice("Back to results — marks cleared")
 		}
 	}
 	return v, nil
@@ -321,6 +419,16 @@ func (v *scanView) visibleFindings() []types.Finding {
 	return out
 }
 
+// maxVisibleRows returns the number of body rows available for the findings table.
+func (v *scanView) maxVisibleRows() int {
+	// legend(1) + notice(1) + breathing room(1)
+	r := v.height - 3
+	if r < 5 {
+		r = 5
+	}
+	return r
+}
+
 func (v *scanView) View(width, height int) string {
 	v.width, v.height = width, height
 	body := ""
@@ -330,13 +438,12 @@ func (v *scanView) View(width, height int) string {
 	case phaseConfirm:
 		body = v.viewTable() + "\n\n" + v.viewConfirm()
 	default:
-		body = v.legendRow() + "\n" + v.viewTable()
+		body = v.legendRow() + "\n" + v.noticeRow() + v.viewTable()
 	}
 	return body
 }
 
-// legendRow renders an inline risk legend so a new user immediately learns
-// what the colored chips next to each row mean.
+// legendRow renders an inline risk legend + search banner.
 func (v *scanView) legendRow() string {
 	parts := []string{
 		dimStyle.Render("risk:"),
@@ -344,7 +451,31 @@ func (v *scanView) legendRow() string {
 		riskChip("MEDIUM") + " " + dimStyle.Render("rebuild needed"),
 		riskChip("DANGEROUS") + " " + dimStyle.Render("may lose data"),
 	}
-	return strings.Join(parts, "  ")
+	legend := strings.Join(parts, "  ")
+
+	if v.search != "" {
+		searchInfo := "  " + searchBannerStyle.Render(" SEARCH ") + " " +
+			dimStyle.Render("filtering by: ") + searchTermStyle.Render("\""+v.search+"\"")
+		if v.searching {
+			searchInfo += dimStyle.Render(" (typing…)")
+		} else {
+			searchInfo += dimStyle.Render(" — press / to edit, esc to clear")
+		}
+		return legend + searchInfo
+	}
+	if v.searching {
+		return legend + "  " + searchBannerStyle.Render(" SEARCH ") +
+			" " + dimStyle.Render("type to filter…")
+	}
+	return legend
+}
+
+// noticeRow returns a transient notice line (or empty string).
+func (v *scanView) noticeRow() string {
+	if v.notice == nil {
+		return ""
+	}
+	return "\n" + lipgloss.NewStyle().Foreground(colorAccent2).Italic(true).Render("  → "+v.notice.text)
 }
 
 func (v *scanView) viewTable() string {
@@ -353,43 +484,64 @@ func (v *scanView) viewTable() string {
 		if v.phase == phaseScanning {
 			return v.viewScanningEmpty()
 		}
+		if v.search != "" {
+			return "\n" + mutedStyle.Render(fmt.Sprintf(
+				"  No results for \"%s\" — try a shorter term or press esc to clear", v.search))
+		}
 		return mutedStyle.Render("  no findings")
 	}
-	maxRows := v.height - 3 // legend row + breathing room
-	if maxRows < 5 {
-		maxRows = 5
-	}
+
+	maxRows := v.maxVisibleRows()
 	catTotals := map[types.Category]int64{}
 	catCounts := map[types.Category]int{}
 	for _, f := range display {
 		catTotals[f.Category] += f.Size
 		catCounts[f.Category]++
 	}
-	start := 0
-	if v.cursor > maxRows-4 {
-		start = v.cursor - (maxRows - 4)
+
+	// Clamp scroll
+	if v.scroll < 0 {
+		v.scroll = 0
 	}
+	if v.scroll > len(display)-1 {
+		v.scroll = len(display) - 1
+	}
+
 	var rows []string
 	var lastCat types.Category
-	for i := start; i < len(display); i++ {
+	rowCount := 0
+	for i := v.scroll; i < len(display) && rowCount < maxRows; i++ {
 		f := display[i]
 		if f.Category != lastCat {
 			rows = append(rows, v.renderCategoryHeader(f.Category, catTotals[f.Category], catCounts[f.Category]))
+			rowCount++
 			lastCat = f.Category
 		}
 		rows = append(rows, v.renderRow(f, i == v.cursor))
-		if len(rows) >= maxRows {
-			break
-		}
+		rowCount++
 	}
-	return strings.Join(rows, "\n")
+
+	// Scroll indicator
+	total := len(display)
+	if total > maxRows {
+		pct := 0
+		if total > 1 {
+			pct = v.cursor * 100 / (total - 1)
+		}
+		indicator := scrollStyle.Render(fmt.Sprintf(
+			"  ↕ %d/%d  (%d%%)  g=top  G=bottom  ctrl+d/u=page",
+			v.cursor+1, total, pct))
+		rows = append(rows, indicator)
+	}
+
+	return "\n" + strings.Join(rows, "\n")
 }
 
 func (v *scanView) renderCategoryHeader(cat types.Category, total int64, count int) string {
 	head := fmt.Sprintf("▾ %s  %s  %s",
-		headerStyle.Render(string(cat)),
+		lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render(string(cat)),
 		mutedStyle.Render(humanize.IBytes(uint64(total))),
-		subtleStyle.Render(fmt.Sprintf("(%d)", count)),
+		subtleStyle.Render(fmt.Sprintf("(%d items)", count)),
 	)
 	if blurb := categoryBlurb(cat); blurb != "" {
 		head += "\n  " + dimStyle.Render(blurb)
@@ -417,12 +569,15 @@ func (v *scanView) renderRow(f types.Finding, selected bool) string {
 }
 
 func (v *scanView) viewScanningEmpty() string {
-	spinner := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
-	frame := spinner[(time.Now().UnixMilli()/100)%int64(len(spinner))]
+	frames := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+	frame := frames[(time.Now().UnixMilli()/100)%int64(len(frames))]
 	dot := lipgloss.NewStyle().Foreground(colorAccent).Render(frame)
+	elapsed := time.Since(v.startedAt).Round(time.Second)
 	lines := []string{
 		"",
 		"  " + dot + "  " + headerStyle.Render("Scanning your home directory and known cache paths"),
+		"  " + dimStyle.Render(fmt.Sprintf("Elapsed: %s · %d findings so far · active detector: %s",
+			elapsed, v.scanned, v.activeName)),
 		"",
 		"  " + dimStyle.Render("This typically takes 10-30 seconds. Detectors run concurrently;"),
 		"  " + dimStyle.Render("findings stream in as they are discovered."),
@@ -440,21 +595,44 @@ func (v *scanView) viewConfirm() string {
 			risk = f.Risk
 		}
 	}
-	heading := riskChip(risk.String()) + "  " + headerStyle.Render("Confirm cleanup")
-	mode := "live · files will be deleted"
+	heading := riskChip(risk.String()) + "  " +
+		lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render("Confirm Deletion")
+
+	mode := "LIVE — files will be permanently deleted"
 	if v.dryRun {
-		mode = "dry-run · nothing will be deleted"
+		mode = "DRY-RUN — nothing will actually be deleted"
 	}
+
+	// Show first 3 marked paths
+	var previewLines []string
+	for i, f := range marked {
+		if i >= 3 {
+			previewLines = append(previewLines, dimStyle.Render(fmt.Sprintf("  … and %d more item(s)", len(marked)-3)))
+			break
+		}
+		chip := riskChip(f.Risk.String())
+		previewLines = append(previewLines, fmt.Sprintf("  %s  %s  %s",
+			chip,
+			mutedStyle.Render(fmt.Sprintf("%10s", humanize.IBytes(uint64(f.Size)))),
+			dimStyle.Render(shortPath(f.Path))))
+	}
+
 	lines := []string{
 		heading,
 		"",
-		fmt.Sprintf("%d items across this selection.", len(marked)),
-		fmt.Sprintf("Reclaimable: %s", headerStyle.Render(humanize.IBytes(uint64(total)))),
-		dimStyle.Render("Mode: " + mode),
+		fmt.Sprintf("%d item(s) selected   Reclaimable: %s",
+			len(marked),
+			lipgloss.NewStyle().Foreground(colorAccent2).Bold(true).Render(humanize.IBytes(uint64(total)))),
 		"",
-		footerKeyStyle.Render("y") + " confirm    " + footerKeyStyle.Render("n") + " cancel",
 	}
-	return modalStyle.Render(strings.Join(lines, "\n"))
+	lines = append(lines, previewLines...)
+	lines = append(lines,
+		"",
+		dimStyle.Render("Mode: "+mode),
+		"",
+		approveKeyStyle.Render(" y ")+" confirm    "+rejectKeyStyle.Render(" n/esc ")+" cancel",
+	)
+	return approvalBoxForRisk(risk.String()).Render(strings.Join(lines, "\n"))
 }
 
 func (v *scanView) viewDone() string {
@@ -466,11 +644,16 @@ func (v *scanView) viewDone() string {
 	if v.cleanReport.DryRun {
 		mode = "dry-run"
 	}
-	fmt.Fprintf(&b, "mode: %s\n", mode)
-	fmt.Fprintf(&b, "reclaimed: %s\n", humanize.IBytes(uint64(v.cleanReport.BytesFreed)))
+	fmt.Fprintf(&b, "%s  mode: %s\n",
+		doneBadgeStyle.Render(" DONE "), mode)
+	fmt.Fprintf(&b, "%s  reclaimed: %s\n",
+		doneBadgeStyle.Render("      "),
+		lipgloss.NewStyle().Foreground(colorAccent2).Bold(true).Render(humanize.IBytes(uint64(v.cleanReport.BytesFreed))))
 	if v.cleanReport.DiskBefore > 0 {
 		delta := v.cleanReport.DiskAfter - v.cleanReport.DiskBefore
-		fmt.Fprintf(&b, "disk free delta: %s\n", humanize.IBytes(uint64(delta)))
+		fmt.Fprintf(&b, "%s  disk free Δ: %s\n",
+			doneBadgeStyle.Render("      "),
+			humanize.IBytes(uint64(delta)))
 	}
 	b.WriteString("\n")
 	for _, r := range v.cleanReport.Results {
@@ -485,5 +668,30 @@ func (v *scanView) viewDone() string {
 		}
 		b.WriteString("\n")
 	}
+	b.WriteString("\n")
+	b.WriteString(dimStyle.Render("Press esc to return to the findings list."))
 	return b.String()
+}
+
+// shortPath truncates a path to the last 2 components for display.
+func shortPath(p string) string {
+	parts := strings.Split(p, "/")
+	if len(parts) <= 3 {
+		return p
+	}
+	return "…/" + strings.Join(parts[len(parts)-2:], "/")
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }

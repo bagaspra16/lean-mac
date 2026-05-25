@@ -2,7 +2,7 @@ package ui
 
 import "github.com/charmbracelet/lipgloss"
 
-// Palette — sober, terminal-native. Chosen to read well on both light and
+// Palette — gold brand, terminal-native. Chosen to read well on both light and
 // dark backgrounds without setting bg on every line.
 var (
 	colorFg      = lipgloss.AdaptiveColor{Light: "#1F2937", Dark: "#E5E7EB"}
@@ -11,14 +11,22 @@ var (
 	colorBorder  = lipgloss.AdaptiveColor{Light: "#D1D5DB", Dark: "#334155"}
 	colorBorderH = lipgloss.AdaptiveColor{Light: "#9CA3AF", Dark: "#475569"}
 
-	colorAccent  = lipgloss.Color("#8B5CF6") // violet — brand
-	colorAccent2 = lipgloss.Color("#A78BFA") // violet light
+	colorAccent  = lipgloss.Color("#D4A017") // pure gold — brand
+	colorAccent2 = lipgloss.Color("#F5C842") // gold light
+	colorAccent3 = lipgloss.Color("#B8860B") // dark gold
 	colorAI      = lipgloss.Color("#06B6D4") // cyan — AI assistant
 	colorSafe    = lipgloss.Color("#10B981") // green
 	colorMed     = lipgloss.Color("#F59E0B") // amber
 	colorDang    = lipgloss.Color("#EF4444") // red
 	colorSel     = lipgloss.Color("#3B82F6") // blue — selection
-	colorInk     = lipgloss.Color("#FFFFFF")
+	colorInk     = lipgloss.Color("#0A0A0A") // near-black ink on gold
+	colorGoldDim = lipgloss.Color("#7A5C00") // dim gold for subtle use
+
+	// AI process step colors
+	colorAIThink  = lipgloss.Color("#A78BFA") // violet for thinking
+	colorAITool   = lipgloss.Color("#34D399") // emerald for tool calls
+	colorAISystem = lipgloss.Color("#94A3B8") // slate for system
+	colorAIExec   = lipgloss.Color("#FB923C") // orange for executing
 )
 
 // Chrome — header band, tabs, info strip, footer.
@@ -30,8 +38,8 @@ var (
 			Padding(0, 2)
 
 	brandVersionStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("#DDD6FE")).
-				Background(colorAccent).
+				Foreground(lipgloss.Color("#3D2800")).
+				Background(colorAccent3).
 				Padding(0, 1)
 
 	viewTitleStyle = lipgloss.NewStyle().
@@ -95,7 +103,7 @@ var (
 
 	cardStyle = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
-			BorderForeground(colorBorderH).
+			BorderForeground(colorAccent3).
 			Padding(1, 2)
 
 	sectionStyle = lipgloss.NewStyle().
@@ -113,18 +121,18 @@ var (
 	dimStyle    = lipgloss.NewStyle().Foreground(colorMuted)
 
 	selectedRowStyle = lipgloss.NewStyle().
-				Foreground(colorFg).
-				Background(lipgloss.AdaptiveColor{Light: "#EEF2FF", Dark: "#1E293B"}).
+				Foreground(colorInk).
+				Background(colorAccent).
 				Bold(true)
 
-	markedStyle = lipgloss.NewStyle().Foreground(colorSel).Bold(true)
+	markedStyle = lipgloss.NewStyle().Foreground(colorAccent2).Bold(true)
 
 	riskSafe = lipgloss.NewStyle().Foreground(colorSafe).Bold(true)
 	riskMed  = lipgloss.NewStyle().Foreground(colorMed).Bold(true)
 	riskDang = lipgloss.NewStyle().Foreground(colorDang).Bold(true)
 
 	riskChipSafe = lipgloss.NewStyle().
-			Foreground(colorInk).
+			Foreground(lipgloss.Color("#FFFFFF")).
 			Background(colorSafe).
 			Bold(true).
 			Padding(0, 1)
@@ -134,7 +142,7 @@ var (
 			Bold(true).
 			Padding(0, 1)
 	riskChipDang = lipgloss.NewStyle().
-			Foreground(colorInk).
+			Foreground(lipgloss.Color("#FFFFFF")).
 			Background(colorDang).
 			Bold(true).
 			Padding(0, 1)
@@ -143,12 +151,28 @@ var (
 			Border(lipgloss.DoubleBorder()).
 			BorderForeground(colorAccent).
 			Padding(1, 3)
+
+	// Search highlight
+	searchBannerStyle = lipgloss.NewStyle().
+				Foreground(colorInk).
+				Background(colorAccent).
+				Bold(true).
+				Padding(0, 1)
+
+	searchTermStyle = lipgloss.NewStyle().
+			Foreground(colorAccent2).
+			Bold(true)
+
+	// Scroll position indicator
+	scrollStyle = lipgloss.NewStyle().
+			Foreground(colorGoldDim).
+			Italic(true)
 )
 
-// AI chat — role badges, input boxes, sample-prompt chips.
+// AI chat — role badges, input boxes, sample-prompt chips, process steps.
 var (
 	aiBadgeStyle = lipgloss.NewStyle().
-			Foreground(colorInk).
+			Foreground(lipgloss.Color("#FFFFFF")).
 			Background(colorAI).
 			Bold(true).
 			Padding(0, 1)
@@ -160,13 +184,50 @@ var (
 			Padding(0, 1)
 
 	systemBadgeStyle = lipgloss.NewStyle().
-				Foreground(colorMuted).
+				Foreground(colorAISystem).
 				Bold(true)
+
+	// Process step badges
+	thinkBadgeStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#FFFFFF")).
+			Background(colorAIThink).
+			Bold(true).
+			Padding(0, 1)
+
+	toolBadgeStyle = lipgloss.NewStyle().
+			Foreground(colorInk).
+			Background(colorAITool).
+			Bold(true).
+			Padding(0, 1)
+
+	execBadgeStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#FFFFFF")).
+			Background(colorAIExec).
+			Bold(true).
+			Padding(0, 1)
+
+	scanBadgeStyle = lipgloss.NewStyle().
+			Foreground(colorInk).
+			Background(colorAccent2).
+			Bold(true).
+			Padding(0, 1)
+
+	doneBadgeStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#FFFFFF")).
+			Background(colorSafe).
+			Bold(true).
+			Padding(0, 1)
+
+	errorBadgeStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#FFFFFF")).
+			Background(colorDang).
+			Bold(true).
+			Padding(0, 1)
 
 	chipStyle = lipgloss.NewStyle().
 			Foreground(colorFg).
 			Border(lipgloss.RoundedBorder()).
-			BorderForeground(colorBorderH).
+			BorderForeground(colorAccent3).
 			Padding(0, 1).
 			MarginRight(1)
 
@@ -179,6 +240,51 @@ var (
 				Border(lipgloss.RoundedBorder()).
 				BorderForeground(colorAccent).
 				Padding(0, 1)
+
+	// Approval dialog styles
+	approvalBoxStyle = lipgloss.NewStyle().
+				Border(lipgloss.ThickBorder()).
+				BorderForeground(colorAccent).
+				Padding(1, 2)
+
+	approvalSafeStyle = lipgloss.NewStyle().
+				Border(lipgloss.ThickBorder()).
+				BorderForeground(colorSafe).
+				Padding(1, 2)
+
+	approvalMedStyle = lipgloss.NewStyle().
+				Border(lipgloss.ThickBorder()).
+				BorderForeground(colorMed).
+				Padding(1, 2)
+
+	approvalDangStyle = lipgloss.NewStyle().
+				Border(lipgloss.DoubleBorder()).
+				BorderForeground(colorDang).
+				Padding(1, 2)
+
+	approveKeyStyle = lipgloss.NewStyle().
+			Foreground(colorInk).
+			Background(colorSafe).
+			Bold(true).
+			Padding(0, 1)
+
+	rejectKeyStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#FFFFFF")).
+			Background(colorDang).
+			Bold(true).
+			Padding(0, 1)
+
+	autoKeyStyle = lipgloss.NewStyle().
+			Foreground(colorInk).
+			Background(colorAccent2).
+			Bold(true).
+			Padding(0, 1)
+
+	cancelKeyStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#FFFFFF")).
+			Background(colorAISystem).
+			Bold(true).
+			Padding(0, 1)
 )
 
 func riskStyle(label string) lipgloss.Style {
@@ -203,6 +309,19 @@ func riskChip(label string) string {
 		return riskChipDang.Render(" DANGER ")
 	}
 	return mutedStyle.Render(label)
+}
+
+// approvalBoxForRisk returns the correct border style for the risk level.
+func approvalBoxForRisk(label string) lipgloss.Style {
+	switch label {
+	case "SAFE":
+		return approvalSafeStyle
+	case "MEDIUM":
+		return approvalMedStyle
+	case "DANGEROUS":
+		return approvalDangStyle
+	}
+	return approvalBoxStyle
 }
 
 // footerHint renders "key act" chunks separated by a thin dot.
