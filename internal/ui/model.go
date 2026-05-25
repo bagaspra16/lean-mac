@@ -8,12 +8,11 @@ import (
 	"time"
 
 	"github.com/bagaspra16/lean-mac/internal/cleaner"
-	"github.com/bagaspra16/lean-mac/internal/fsutil"
+	"github.com/bagaspra16/lean-mac/internal/detectors"
 	"github.com/bagaspra16/lean-mac/internal/scanner"
 	"github.com/bagaspra16/lean-mac/internal/types"
 
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
 	"github.com/dustin/go-humanize"
 )
 
@@ -32,7 +31,8 @@ type scanDoneMsg struct{ report *types.ScanReport }
 type cleanDoneMsg struct{ report *types.CleanReport }
 type tickMsg time.Time
 
-type Model struct {
+// scanView is the Scan tab. Compatible with the `view` interface.
+type scanView struct {
 	scn         *scanner.Scanner
 	progressCh  chan scanner.Progress
 	report      *types.ScanReport
@@ -48,32 +48,28 @@ type Model struct {
 	activeName  string
 	scanned     int
 	startedAt   time.Time
-	diskFree    int64
-	diskTotal   int64
 	dryRun      bool
 	scanDone    chan *types.ScanReport
 }
 
-func NewModel(scn *scanner.Scanner, dryRun bool) Model {
-	free, total, _ := fsutil.DiskUsage("/")
-	return Model{
-		scn:        scn,
+func newScanView(dryRun bool) *scanView {
+	s := scanner.New(detectors.Default()...)
+	return &scanView{
+		scn:        s,
 		marked:     map[string]bool{},
 		phase:      phaseScanning,
 		startedAt:  time.Now(),
-		diskFree:   free,
-		diskTotal:  total,
 		dryRun:     dryRun,
 		progressCh: make(chan scanner.Progress, 64),
 		scanDone:   make(chan *types.ScanReport, 1),
 	}
 }
 
-func (m Model) Init() tea.Cmd {
+func (v *scanView) Init() tea.Cmd {
 	go func() {
-		m.scanDone <- m.scn.Run(context.Background(), m.progressCh)
+		v.scanDone <- v.scn.Run(context.Background(), v.progressCh)
 	}()
-	return tea.Batch(waitProgress(m.progressCh, m.scanDone), tickEvery())
+	return tea.Batch(waitProgress(v.progressCh, v.scanDone), tickEvery())
 }
 
 func waitProgress(ch chan scanner.Progress, done chan *types.ScanReport) tea.Cmd {
@@ -90,157 +86,191 @@ func tickEvery() tea.Cmd {
 	return tea.Tick(200*time.Millisecond, func(t time.Time) tea.Msg { return tickMsg(t) })
 }
 
-func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+func (v *scanView) Title() string {
+	switch v.phase {
+	case phaseScanning:
+		return "Scanning"
+	case phaseConfirm:
+		return "Confirm cleanup"
+	case phaseDone:
+		return "Cleanup complete"
+	default:
+		return "Findings"
+	}
+}
+
+func (v *scanView) Status() string {
+	if v.phase == phaseScanning {
+		return fmt.Sprintf("active: %s · %d found", v.activeName, v.scanned)
+	}
+	var total int64
+	for _, f := range v.findings {
+		total += f.Size
+	}
+	tag := ""
+	if v.dryRun {
+		tag = " · dry-run"
+	}
+	return fmt.Sprintf("reclaimable %s%s", humanize.IBytes(uint64(total)), tag)
+}
+
+func (v *scanView) Footer() string {
+	if v.searching {
+		return "/" + v.search + " · enter/esc done"
+	}
+	switch v.phase {
+	case phaseConfirm:
+		return "y confirm · n cancel"
+	case phaseDone:
+		return "esc back to findings"
+	default:
+		return fmt.Sprintf("j/k move · space mark · a mark-safe · / search · d delete (%d marked)", v.countMarked())
+	}
+}
+
+func (v *scanView) Update(msg tea.Msg) (view, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
-		m.width, m.height = msg.Width, msg.Height
-		return m, nil
-
+		v.width, v.height = msg.Width, msg.Height
+		return v, nil
 	case tickMsg:
-		if m.phase == phaseScanning {
-			return m, tickEvery()
+		if v.phase == phaseScanning {
+			return v, tickEvery()
 		}
-		return m, nil
-
+		return v, nil
 	case scanProgressMsg:
 		if msg.p.Finding != nil {
-			m.findings = append(m.findings, *msg.p.Finding)
-			m.scanned++
+			v.findings = append(v.findings, *msg.p.Finding)
+			v.scanned++
 		}
-		m.activeName = msg.p.Detector
-		return m, waitProgress(m.progressCh, m.scanDone)
-
+		v.activeName = msg.p.Detector
+		return v, waitProgress(v.progressCh, v.scanDone)
 	case scanDoneMsg:
-		m.report = msg.report
-		m.findings = msg.report.Findings
-		m.phase = phaseReady
-		return m, nil
-
+		v.report = msg.report
+		v.findings = msg.report.Findings
+		v.phase = phaseReady
+		return v, nil
 	case cleanDoneMsg:
-		m.cleanReport = msg.report
-		m.phase = phaseDone
-		return m, nil
-
+		v.cleanReport = msg.report
+		v.phase = phaseDone
+		return v, nil
 	case tea.KeyMsg:
-		if m.searching {
-			return m.updateSearch(msg)
+		if v.searching {
+			return v.updateSearch(msg)
 		}
-		return m.updateKey(msg)
+		return v.updateKey(msg)
 	}
-	return m, nil
+	return v, nil
 }
 
-func (m Model) updateSearch(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (v *scanView) updateSearch(msg tea.KeyMsg) (view, tea.Cmd) {
 	switch msg.Type {
 	case tea.KeyEnter, tea.KeyEsc:
-		m.searching = false
-		return m, nil
+		v.searching = false
 	case tea.KeyBackspace:
-		if len(m.search) > 0 {
-			m.search = m.search[:len(m.search)-1]
+		if len(v.search) > 0 {
+			v.search = v.search[:len(v.search)-1]
 		}
-		return m, nil
 	case tea.KeyRunes:
-		m.search += string(msg.Runes)
-		return m, nil
+		v.search += string(msg.Runes)
 	}
-	return m, nil
+	return v, nil
 }
 
-func (m Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	visible := m.visibleFindings()
+func (v *scanView) updateKey(msg tea.KeyMsg) (view, tea.Cmd) {
+	visible := v.visibleFindings()
 	switch msg.String() {
-	case "q", "ctrl+c":
-		return m, tea.Quit
 	case "j", "down":
-		if m.cursor < len(visible)-1 {
-			m.cursor++
+		if v.cursor < len(visible)-1 {
+			v.cursor++
 		}
 	case "k", "up":
-		if m.cursor > 0 {
-			m.cursor--
+		if v.cursor > 0 {
+			v.cursor--
 		}
 	case "g":
-		m.cursor = 0
+		v.cursor = 0
 	case "G":
 		if len(visible) > 0 {
-			m.cursor = len(visible) - 1
+			v.cursor = len(visible) - 1
 		}
 	case " ":
-		if m.cursor < len(visible) {
-			f := visible[m.cursor]
-			m.marked[f.Path] = !m.marked[f.Path]
+		if v.cursor < len(visible) {
+			f := visible[v.cursor]
+			v.marked[f.Path] = !v.marked[f.Path]
 		}
 	case "a":
 		for _, f := range visible {
 			if f.Risk == types.RiskSafe {
-				m.marked[f.Path] = true
+				v.marked[f.Path] = true
 			}
 		}
 	case "/":
-		if m.phase == phaseReady {
-			m.searching = true
-			m.search = ""
+		if v.phase == phaseReady {
+			v.searching = true
+			v.search = ""
 		}
 	case "d":
-		if m.phase == phaseReady && m.countMarked() > 0 {
-			m.phase = phaseConfirm
+		if v.phase == phaseReady && v.countMarked() > 0 {
+			v.phase = phaseConfirm
 		}
 	case "y":
-		if m.phase == phaseConfirm {
-			return m, m.runClean()
+		if v.phase == phaseConfirm {
+			return v, v.runClean()
 		}
 	case "n", "esc":
-		if m.phase == phaseConfirm {
-			m.phase = phaseReady
+		if v.phase == phaseConfirm {
+			v.phase = phaseReady
+		} else if v.phase == phaseDone {
+			v.phase = phaseReady
+			v.cleanReport = nil
+			v.marked = map[string]bool{}
 		}
 	}
-	return m, nil
+	return v, nil
 }
 
-func (m Model) countMarked() int {
+func (v *scanView) countMarked() int {
 	n := 0
-	for _, v := range m.marked {
-		if v {
+	for _, ok := range v.marked {
+		if ok {
 			n++
 		}
 	}
 	return n
 }
 
-func (m Model) markedFindings() []types.Finding {
+func (v *scanView) markedFindings() []types.Finding {
 	var out []types.Finding
-	for _, f := range m.findings {
-		if m.marked[f.Path] {
+	for _, f := range v.findings {
+		if v.marked[f.Path] {
 			out = append(out, f)
 		}
 	}
 	return out
 }
 
-func (m Model) runClean() tea.Cmd {
-	findings := m.markedFindings()
-	dry := m.dryRun
+func (v *scanView) runClean() tea.Cmd {
+	findings := v.markedFindings()
+	dry := v.dryRun
 	return func() tea.Msg {
 		c := cleaner.New(cleaner.Options{DryRun: dry, Aggressive: true, IncludeDangerous: true})
 		return cleanDoneMsg{report: c.Clean(context.Background(), findings)}
 	}
 }
 
-// visibleFindings returns the findings to render, grouped by category and
-// sorted by group total then by per-item size. Cursor indexes into this slice
-// directly, so display order == selection order.
-func (m Model) visibleFindings() []types.Finding {
-	src := m.findings
-	if m.search != "" {
-		q := strings.ToLower(m.search)
-		src = src[:0:0]
-		for _, f := range m.findings {
+func (v *scanView) visibleFindings() []types.Finding {
+	src := v.findings
+	if v.search != "" {
+		q := strings.ToLower(v.search)
+		filtered := make([]types.Finding, 0, len(src))
+		for _, f := range src {
 			if strings.Contains(strings.ToLower(string(f.Category)), q) ||
 				strings.Contains(strings.ToLower(f.Path), q) {
-				src = append(src, f)
+				filtered = append(filtered, f)
 			}
 		}
+		src = filtered
 	}
 	type group struct {
 		cat   types.Category
@@ -270,115 +300,53 @@ func (m Model) visibleFindings() []types.Finding {
 	return out
 }
 
-// --- view ---
-
-func (m Model) View() string {
-	if m.width == 0 {
-		return "initializing…"
-	}
-	switch m.phase {
+func (v *scanView) View(width, height int) string {
+	v.width, v.height = width, height+4 // map back to internal height for sizing helpers
+	switch v.phase {
 	case phaseDone:
-		return m.viewDone()
+		return v.viewDone()
 	case phaseConfirm:
-		return m.viewMain() + "\n" + m.viewConfirm()
+		return v.viewTable() + "\n\n" + v.viewConfirm()
 	default:
-		return m.viewMain()
+		return v.viewTable()
 	}
 }
 
-func (m Model) viewMain() string {
-	var b strings.Builder
-	b.WriteString(m.viewHeader())
-	b.WriteString("\n")
-	if m.phase == phaseScanning {
-		b.WriteString(m.viewScanProgress())
-		b.WriteString("\n")
-	}
-	b.WriteString(m.viewTable())
-	b.WriteString("\n")
-	b.WriteString(m.viewStatus())
-	return b.String()
-}
-
-func (m Model) viewHeader() string {
-	title := titleStyle.Render(" LEAN-MAC ")
-	used := m.diskTotal - m.diskFree
-	pct := 0
-	if m.diskTotal > 0 {
-		pct = int(float64(used) / float64(m.diskTotal) * 100)
-	}
-	disk := fmt.Sprintf("disk %s / %s (%d%% used, %s free)",
-		humanize.IBytes(uint64(used)),
-		humanize.IBytes(uint64(m.diskTotal)),
-		pct,
-		humanize.IBytes(uint64(m.diskFree)),
-	)
-	total := int64(0)
-	for _, f := range m.findings {
-		total += f.Size
-	}
-	reclaim := fmt.Sprintf("reclaimable %s", humanize.IBytes(uint64(total)))
-	if m.dryRun {
-		reclaim += "  " + mutedStyle.Render("[dry-run]")
-	}
-	right := mutedStyle.Render(disk) + "  " + headerStyle.Render(reclaim)
-	left := title
-	gap := m.width - lipgloss.Width(left) - lipgloss.Width(right)
-	if gap < 1 {
-		gap = 1
-	}
-	return left + strings.Repeat(" ", gap) + right
-}
-
-func (m Model) viewScanProgress() string {
-	dur := time.Since(m.startedAt).Truncate(time.Second)
-	return mutedStyle.Render(fmt.Sprintf("scanning… %s | active: %s | findings: %d",
-		dur, m.activeName, m.scanned))
-}
-
-func (m Model) viewTable() string {
-	display := m.visibleFindings()
+func (v *scanView) viewTable() string {
+	display := v.visibleFindings()
 	if len(display) == 0 {
-		if m.phase == phaseScanning {
-			return mutedStyle.Render("  (scanning…)")
+		if v.phase == phaseScanning {
+			return mutedStyle.Render("  scanning…")
 		}
-		return mutedStyle.Render("  (no findings)")
+		return mutedStyle.Render("  no findings")
 	}
-	maxRows := m.height - 8
+	maxRows := v.height - 8
 	if maxRows < 5 {
 		maxRows = 5
 	}
-	// emit category section headers when the category changes; the cursor
-	// indexes only the item rows (not headers), which matches visibleFindings.
-	var rows []string
-	var lastCat types.Category
-	var catTotal int64
-	var catCount int
-	// pre-compute per-category totals from display
 	catTotals := map[types.Category]int64{}
 	catCounts := map[types.Category]int{}
 	for _, f := range display {
 		catTotals[f.Category] += f.Size
 		catCounts[f.Category]++
 	}
-	// window around cursor so a long list scrolls
 	start := 0
-	if m.cursor > maxRows-3 {
-		start = m.cursor - (maxRows - 3)
+	if v.cursor > maxRows-3 {
+		start = v.cursor - (maxRows - 3)
 	}
+	var rows []string
+	var lastCat types.Category
 	for i := start; i < len(display); i++ {
 		f := display[i]
 		if f.Category != lastCat {
-			catTotal = catTotals[f.Category]
-			catCount = catCounts[f.Category]
 			rows = append(rows, fmt.Sprintf("▾ %s  %s  (%d items)",
 				headerStyle.Render(string(f.Category)),
-				mutedStyle.Render(humanize.IBytes(uint64(catTotal))),
-				catCount,
+				mutedStyle.Render(humanize.IBytes(uint64(catTotals[f.Category]))),
+				catCounts[f.Category],
 			))
 			lastCat = f.Category
 		}
-		rows = append(rows, m.renderRow(f, i == m.cursor))
+		rows = append(rows, v.renderRow(f, i == v.cursor))
 		if len(rows) >= maxRows {
 			break
 		}
@@ -386,9 +354,9 @@ func (m Model) viewTable() string {
 	return strings.Join(rows, "\n")
 }
 
-func (m Model) renderRow(f types.Finding, selected bool) string {
+func (v *scanView) renderRow(f types.Finding, selected bool) string {
 	marker := " "
-	if m.marked[f.Path] {
+	if v.marked[f.Path] {
 		marker = markedStyle.Render("●")
 	}
 	var risk string
@@ -402,7 +370,7 @@ func (m Model) renderRow(f types.Finding, selected bool) string {
 	}
 	size := humanize.IBytes(uint64(f.Size))
 	path := f.Path
-	maxPath := m.width - 30
+	maxPath := v.width - 30
 	if maxPath > 0 && len(path) > maxPath {
 		path = "…" + path[len(path)-maxPath+1:]
 	}
@@ -413,62 +381,48 @@ func (m Model) renderRow(f types.Finding, selected bool) string {
 	return rowStyle.Render(line)
 }
 
-func (m Model) viewStatus() string {
-	var bar string
-	if m.searching {
-		bar = "/" + m.search + "█  (esc to cancel)"
-	} else {
-		marked := m.countMarked()
-		bar = fmt.Sprintf("j/k move • space mark • a mark-safe • / search • d delete (%d marked) • q quit", marked)
-	}
-	return statusBarStyle.Width(m.width).Render(bar)
-}
-
-func (m Model) viewConfirm() string {
-	marked := m.markedFindings()
+func (v *scanView) viewConfirm() string {
+	marked := v.markedFindings()
 	var total int64
 	for _, f := range marked {
 		total += f.Size
 	}
 	mode := "DELETE"
-	if m.dryRun {
-		mode = "DRY-RUN (no files will be deleted)"
+	if v.dryRun {
+		mode = "DRY-RUN (nothing will be deleted)"
 	}
-	body := fmt.Sprintf("%s\n\n%d items, %s reclaimable\n\n[y] confirm  [n] cancel",
+	body := fmt.Sprintf("%s\n\n%d items, %s reclaimable\n\n[y] confirm   [n] cancel",
 		mode, len(marked), humanize.IBytes(uint64(total)))
 	return modalStyle.Render(body)
 }
 
-func (m Model) viewDone() string {
-	if m.cleanReport == nil {
+func (v *scanView) viewDone() string {
+	if v.cleanReport == nil {
 		return "no cleanup ran."
 	}
 	var b strings.Builder
-	b.WriteString(titleStyle.Render(" CLEANUP COMPLETE "))
-	b.WriteString("\n\n")
 	mode := "executed"
-	if m.cleanReport.DryRun {
+	if v.cleanReport.DryRun {
 		mode = "dry-run"
 	}
-	b.WriteString(fmt.Sprintf("mode: %s\n", mode))
-	b.WriteString(fmt.Sprintf("reclaimed: %s\n", humanize.IBytes(uint64(m.cleanReport.BytesFreed))))
-	if m.cleanReport.DiskBefore > 0 {
-		delta := m.cleanReport.DiskAfter - m.cleanReport.DiskBefore
-		b.WriteString(fmt.Sprintf("disk free delta: %s\n", humanize.IBytes(uint64(delta))))
+	fmt.Fprintf(&b, "mode: %s\n", mode)
+	fmt.Fprintf(&b, "reclaimed: %s\n", humanize.IBytes(uint64(v.cleanReport.BytesFreed)))
+	if v.cleanReport.DiskBefore > 0 {
+		delta := v.cleanReport.DiskAfter - v.cleanReport.DiskBefore
+		fmt.Fprintf(&b, "disk free delta: %s\n", humanize.IBytes(uint64(delta)))
 	}
 	b.WriteString("\n")
-	for _, r := range m.cleanReport.Results {
+	for _, r := range v.cleanReport.Results {
 		status := riskSafe.Render("✓")
 		if !r.Success {
 			status = riskDang.Render("✗")
 		}
-		b.WriteString(fmt.Sprintf(" %s %-20s %10s  %s",
-			status, r.Finding.Category, humanize.IBytes(uint64(r.BytesFreed)), r.Finding.Path))
+		fmt.Fprintf(&b, " %s %-22s %10s  %s",
+			status, r.Finding.Category, humanize.IBytes(uint64(r.BytesFreed)), r.Finding.Path)
 		if r.Error != "" {
-			b.WriteString("  " + mutedStyle.Render(r.Error))
+			fmt.Fprintf(&b, "  %s", mutedStyle.Render(r.Error))
 		}
 		b.WriteString("\n")
 	}
-	b.WriteString("\n" + mutedStyle.Render("press q to exit"))
 	return b.String()
 }

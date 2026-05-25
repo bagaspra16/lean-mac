@@ -9,11 +9,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/bagaspra16/lean-mac/internal/detectors"
+	"github.com/bagaspra16/lean-mac/internal/config"
 	"github.com/bagaspra16/lean-mac/internal/fsutil"
 	"github.com/bagaspra16/lean-mac/internal/monitor"
 	"github.com/bagaspra16/lean-mac/internal/reporting"
-	"github.com/bagaspra16/lean-mac/internal/scanner"
 	"github.com/bagaspra16/lean-mac/internal/ui"
 	"github.com/dustin/go-humanize"
 	"github.com/spf13/cobra"
@@ -35,8 +34,8 @@ func tuiCmd() *cobra.Command {
 }
 
 func runTUI(dryRun bool) error {
-	s := scanner.New(detectors.Default()...)
-	p := tea.NewProgram(ui.NewModel(s, dryRun), tea.WithAltScreen())
+	cfg := config.Load()
+	p := tea.NewProgram(ui.NewApp(cfg, dryRun), tea.WithAltScreen())
 	_, err := p.Run()
 	return err
 }
