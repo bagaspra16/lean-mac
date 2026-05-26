@@ -141,5 +141,23 @@ func safeRemove(path string) error {
 	if home, err := os.UserHomeDir(); err == nil && clean == filepath.Clean(home) {
 		return errors.New("refusing to delete user home directory")
 	}
+
+	// Try standard removal first
+	err = os.RemoveAll(clean)
+	if err == nil || os.IsNotExist(err) {
+		return nil
+	}
+
+	// If it fails (e.g., due to write-protected Go module cache files),
+	// recursively make all files and folders writable and try again.
+	_ = filepath.Walk(clean, func(p string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return nil
+		}
+		// Add write permission for user
+		_ = os.Chmod(p, info.Mode()|0200)
+		return nil
+	})
+
 	return os.RemoveAll(clean)
 }
