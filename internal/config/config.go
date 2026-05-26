@@ -16,7 +16,7 @@ type Config struct {
 
 // Default returns the model defaults; keys empty.
 func Default() Config {
-	return Config{Model: "llama-3.3-70b-versatile"}
+	return Config{Model: "llama-3.1-8b-instant"}
 }
 
 // Load reads env + config file. Returns a usable Config even if both are empty
