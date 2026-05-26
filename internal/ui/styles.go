@@ -103,8 +103,8 @@ var (
 
 	cardStyle = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
-			BorderForeground(colorAccent3).
-			Padding(1, 2)
+			BorderForeground(colorBorder).
+			Padding(1, 4)
 
 	sectionStyle = lipgloss.NewStyle().
 			Foreground(colorAccent).
@@ -209,11 +209,8 @@ var (
 			Bold(true)
 
 	chipStyle = lipgloss.NewStyle().
-			Foreground(colorFg).
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(colorAccent3).
-			Padding(0, 1).
-			MarginRight(1)
+			Foreground(colorAccent2).
+			Italic(true)
 
 	inputBoxStyle = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).

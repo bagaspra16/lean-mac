@@ -34,7 +34,8 @@ const (
 	kindThinking               // "AI is thinking" step indicator
 	kindTool                   // tool call event
 	kindScan                   // scan progress/done
-	kindExec                   // execution result
+	kindExec                   // execution result (finished)
+	kindExecuting              // execution in progress (spinner)
 	kindSystem                 // generic system notice
 	kindDone                   // success result
 	kindError                  // error
@@ -199,7 +200,7 @@ func (v *aiView) Update(msg tea.Msg) (view, tea.Cmd) {
 		v.width, v.height = m.Width, m.Height
 		return v, nil
 	case tickMsg:
-		if v.state == aiThinking {
+		if v.state == aiThinking || v.state == aiExecuting {
 			return v, tickEvery()
 		}
 		return v, nil
@@ -207,7 +208,7 @@ func (v *aiView) Update(msg tea.Msg) (view, tea.Cmd) {
 		return v.onEvent(m.ev)
 	case aiTurnDoneMsg:
 		v.convo = m.msgs
-		// Always remove the thinking placeholder — turn is over.
+		// Always remove the thinking/executing placeholder — turn is over.
 		v.removeThinkingLines()
 		v.thinkingShown = false
 		if m.err != nil {
@@ -234,6 +235,7 @@ func (v *aiView) Update(msg tea.Msg) (view, tea.Cmd) {
 			humanize.IBytes(uint64(v.turnStats.freed)),
 		))
 		v.convo = append(v.convo, ai.FeedbackForModel(v.pending, true, m.freed))
+		v.removeThinkingLines() // remove the execution spinner
 		v.pending = nil
 		v.state = aiThinking
 		v.thinkingShown = false
@@ -374,17 +376,17 @@ func (v *aiView) onKey(msg tea.KeyMsg) (view, tea.Cmd) {
 
 func (v *aiView) approve() tea.Cmd {
 	action := v.pending
-	if action == nil {
-		return nil
-	}
 	v.state = aiExecuting
-	v.appendKind(kindSystem, fmt.Sprintf("✔ Approved — executing %s…", action.Category))
+	v.appendKind(kindExecuting, fmt.Sprintf("Approved — executing %s…", action.Category))
 	dry := v.dryRun
 	events := v.events
-	return func() tea.Msg {
+	
+	execCmd := func() tea.Msg {
 		ai.Execute(context.Background(), action, dry, events)
 		return aiExecDoneMsg{freed: action.Total}
 	}
+	
+	return tea.Batch(execCmd, tickEvery())
 }
 
 func (v *aiView) reject() tea.Cmd {
@@ -410,12 +412,12 @@ func (v *aiView) cancelAgent() tea.Cmd {
 	return nil
 }
 
-// removeThinkingLines removes all thinking-placeholder lines from the chat log.
+// removeThinkingLines removes all thinking/executing placeholder lines from the chat log.
 // Called whenever the turn transitions away from the thinking state.
 func (v *aiView) removeThinkingLines() {
 	filtered := v.lines[:0]
 	for _, l := range v.lines {
-		if l.kind != kindThinking {
+		if l.kind != kindThinking && l.kind != kindExecuting {
 			filtered = append(filtered, l)
 		}
 	}
@@ -427,7 +429,7 @@ func (v *aiView) appendTurnSummary() {
 	s := v.turnStats
 	// Only print a summary when something meaningful happened.
 	if !s.scanned && s.proposed == 0 && s.approved == 0 && s.rejected == 0 {
-		// Pure chat reply — no actions taken. No summary needed.
+		v.appendKind(kindDone, "✨ Process complete. Ready for your next question.")
 		return
 	}
 	var parts []string
@@ -445,8 +447,8 @@ func (v *aiView) appendTurnSummary() {
 	if s.rejected > 0 {
 		parts = append(parts, fmt.Sprintf("rejected %d", s.rejected))
 	}
-	summary := "─── Turn summary: " + strings.Join(parts, " · ") + " ───"
-	v.appendKind(kindSystem, summary)
+	summary := "✨ Process complete: " + strings.Join(parts, " · ") + " — ready for next question."
+	v.appendKind(kindDone, summary)
 }
 
 func (v *aiView) runTurn() tea.Cmd {
@@ -509,35 +511,23 @@ func (v *aiView) View(width, height int) string {
 // viewWelcome renders a card-style splash when no conversation has started.
 func (v *aiView) viewWelcome(width, height int) string {
 	cardWidth := width - 4
-	if cardWidth > 88 {
-		cardWidth = 88
+	if cardWidth > 72 {
+		cardWidth = 72
 	}
 	lines := []string{
 		panelTitleStyle.Render("✦ Welcome to AI Cleanse"),
 		"",
-		panelDescStyle.Render("Ask in plain English. I'll scan your disk, explain what's"),
-		panelDescStyle.Render("eating space, and propose deletions one category at a time."),
-		panelDescStyle.Render("You approve each step — nothing is removed without your y."),
+		panelDescStyle.Render("Ask in plain English. I'll scan your disk and propose"),
+		panelDescStyle.Render("deletions one category at a time. Nothing is removed"),
+		panelDescStyle.Render("without your explicit approval."),
 		"",
 		sectionStyle.Render("Try one of these"),
-		"  " + chipStyle.Render("What's eating my disk?"),
-		"  " + chipStyle.Render("Free up 10 GB safely"),
-		"  " + chipStyle.Render("Show me only Docker cleanup"),
-		"  " + chipStyle.Render("Be aggressive — I haven't touched these in months"),
+		"  " + chipStyle.Render("\"What's eating my disk?\""),
+		"  " + chipStyle.Render("\"Free up 10 GB safely\""),
+		"  " + chipStyle.Render("\"Show me only Docker cleanup\""),
+		"  " + chipStyle.Render("\"Be aggressive — I haven't touched these in months\""),
 		"",
-		sectionStyle.Render("How the AI process works"),
-		"  " + thinkBadgeStyle.Render("[ THINK ]") + "  " + dimStyle.Render("AI analyses your request"),
-		"  " + toolBadgeStyle.Render("[ SCAN  ]") + "  " + dimStyle.Render("Disk is scanned for artifacts"),
-		"  " + scanBadgeStyle.Render("[ PROP  ]") + "  " + dimStyle.Render("AI proposes a cleanup category"),
-		"  " + execBadgeStyle.Render("[ EXEC  ]") + "  " + dimStyle.Render("Files removed after your approval"),
-		"  " + doneBadgeStyle.Render("[ DONE  ]") + "  " + dimStyle.Render("Result reported back to AI"),
-		"",
-		sectionStyle.Render("Risk levels"),
-		"  " + riskChip("SAFE") + "  " + dimStyle.Render(riskBlurb("SAFE")),
-		"  " + riskChip("MEDIUM") + "  " + dimStyle.Render(riskBlurb("MEDIUM")),
-		"  " + riskChip("DANGEROUS") + "  " + dimStyle.Render(riskBlurb("DANGEROUS")),
-		"",
-		dimStyle.Render("Dry-run is ON by default. Press " + footerKeyStyle.Render("a") + " during a SAFE proposal to auto-approve all SAFE steps."),
+		dimStyle.Render("Tip: Dry-run is ON by default. Press ") + footerKeyStyle.Render("a") + dimStyle.Render(" to auto-approve SAFE items."),
 	}
 	card := cardStyle.Width(cardWidth).Render(strings.Join(lines, "\n"))
 	cardH := strings.Count(card, "\n") + 1
@@ -611,6 +601,9 @@ func (v *aiView) formatLine(ln chatLine, width int) []string {
 		badge = thinkBadgeStyle.Render("[ THINK ]") + " " + spinner
 	case kindTool:
 		badge = toolBadgeStyle.Render("[ TOOL  ]")
+	case kindExecuting:
+		spinner := thinkingSpinner()
+		badge = execBadgeStyle.Render("[ EXEC  ]") + " " + spinner
 	case kindScan:
 		badge = scanBadgeStyle.Render("[ SCAN  ]")
 	case kindExec:
