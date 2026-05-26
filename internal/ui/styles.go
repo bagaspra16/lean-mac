@@ -14,7 +14,7 @@ var (
 	colorAccent  = lipgloss.Color("#D4A017") // pure gold — brand
 	colorAccent2 = lipgloss.Color("#F5C842") // gold light
 	colorAccent3 = lipgloss.Color("#B8860B") // dark gold
-	colorAI      = lipgloss.Color("#06B6D4") // cyan — AI assistant
+	colorAI      = lipgloss.Color("#B8860B") // dark gold — AI assistant
 	colorSafe    = lipgloss.Color("#10B981") // green
 	colorMed     = lipgloss.Color("#F59E0B") // amber
 	colorDang    = lipgloss.Color("#EF4444") // red
@@ -22,11 +22,11 @@ var (
 	colorInk     = lipgloss.Color("#0A0A0A") // near-black ink on gold
 	colorGoldDim = lipgloss.Color("#7A5C00") // dim gold for subtle use
 
-	// AI process step colors
-	colorAIThink  = lipgloss.Color("#A78BFA") // violet for thinking
-	colorAITool   = lipgloss.Color("#34D399") // emerald for tool calls
-	colorAISystem = lipgloss.Color("#94A3B8") // slate for system
-	colorAIExec   = lipgloss.Color("#FB923C") // orange for executing
+	// AI process step colors (cohesive professional theme)
+	colorAIThink  = lipgloss.Color("#D4A017") // pure gold
+	colorAITool   = lipgloss.Color("#F5C842") // light gold
+	colorAISystem = lipgloss.Color("#9CA3AF") // subtle slate
+	colorAIExec   = lipgloss.Color("#F59E0B") // amber for executing
 )
 
 // Chrome — header band, tabs, info strip, footer.
@@ -172,16 +172,12 @@ var (
 // AI chat — role badges, input boxes, sample-prompt chips, process steps.
 var (
 	aiBadgeStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#FFFFFF")).
-			Background(colorAI).
-			Bold(true).
-			Padding(0, 1)
+			Foreground(colorAI).
+			Bold(true)
 
 	userBadgeStyle = lipgloss.NewStyle().
-			Foreground(colorInk).
-			Background(colorAccent).
-			Bold(true).
-			Padding(0, 1)
+			Foreground(colorAccent).
+			Bold(true)
 
 	systemBadgeStyle = lipgloss.NewStyle().
 				Foreground(colorAISystem).
@@ -189,40 +185,28 @@ var (
 
 	// Process step badges
 	thinkBadgeStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#FFFFFF")).
-			Background(colorAIThink).
-			Bold(true).
-			Padding(0, 1)
+			Foreground(colorAIThink).
+			Bold(true)
 
 	toolBadgeStyle = lipgloss.NewStyle().
-			Foreground(colorInk).
-			Background(colorAITool).
-			Bold(true).
-			Padding(0, 1)
+			Foreground(colorAITool).
+			Bold(true)
 
 	execBadgeStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#FFFFFF")).
-			Background(colorAIExec).
-			Bold(true).
-			Padding(0, 1)
+			Foreground(colorAIExec).
+			Bold(true)
 
 	scanBadgeStyle = lipgloss.NewStyle().
-			Foreground(colorInk).
-			Background(colorAccent2).
-			Bold(true).
-			Padding(0, 1)
+			Foreground(colorAccent2).
+			Bold(true)
 
 	doneBadgeStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#FFFFFF")).
-			Background(colorSafe).
-			Bold(true).
-			Padding(0, 1)
+			Foreground(colorSafe).
+			Bold(true)
 
 	errorBadgeStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#FFFFFF")).
-			Background(colorDang).
-			Bold(true).
-			Padding(0, 1)
+			Foreground(colorDang).
+			Bold(true)
 
 	chipStyle = lipgloss.NewStyle().
 			Foreground(colorFg).

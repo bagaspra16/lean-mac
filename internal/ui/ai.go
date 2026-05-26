@@ -73,6 +73,20 @@ type aiView struct {
 	events chan ai.Event
 	cancel context.CancelFunc
 
+	// turnStats tracks activity within the current AI turn for the summary.
+	turnStats struct {
+		scanned    bool
+		findings   int
+		reclaimable int64
+		proposed   int
+		approved   int
+		rejected   int
+		freed      int64
+	}
+
+	// thinkingShown prevents duplicate "thinking" lines per turn.
+	thinkingShown bool
+
 	scrollOffset int // manual scroll in approval view
 	width, height int
 }
@@ -184,28 +198,46 @@ func (v *aiView) Update(msg tea.Msg) (view, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		v.width, v.height = m.Width, m.Height
 		return v, nil
+	case tickMsg:
+		if v.state == aiThinking {
+			return v, tickEvery()
+		}
+		return v, nil
 	case aiEventMsg:
 		return v.onEvent(m.ev)
 	case aiTurnDoneMsg:
-		if m.err != nil {
-			v.appendKind(kindError, "error: "+m.err.Error())
-			v.state = aiIdle
-		}
 		v.convo = m.msgs
+		// Always remove the thinking placeholder — turn is over.
+		v.removeThinkingLines()
+		v.thinkingShown = false
+		if m.err != nil {
+			v.appendKind(kindError, "✗ Error: "+m.err.Error())
+			v.state = aiIdle
+			return v, nil
+		}
+		// Only print a summary if no proposal is pending (proposal itself is the
+		// interactive outcome; the user hasn't acted on it yet).
 		if v.state == aiThinking && v.pending == nil {
+			v.appendTurnSummary()
 			v.state = aiIdle
 		}
-		return v, waitAIEvent(v.events)
+		// Do NOT call waitAIEvent here — the turn goroutine is done.
+		// Events channel is drained by the goroutine we return below only when
+		// another turn starts.  We just stop reading.
+		return v, nil
 	case aiExecDoneMsg:
-		v.appendKind(kindDone, fmt.Sprintf("✓ Done — freed %s.", humanize.IBytes(uint64(m.freed))))
+		v.turnStats.freed += m.freed
+		v.turnStats.approved++
+		v.appendKind(kindDone, fmt.Sprintf(
+			"✓ Execution complete — freed %s (session total: %s)",
+			humanize.IBytes(uint64(m.freed)),
+			humanize.IBytes(uint64(v.turnStats.freed)),
+		))
 		v.convo = append(v.convo, ai.FeedbackForModel(v.pending, true, m.freed))
-		approved := v.pending
 		v.pending = nil
 		v.state = aiThinking
-		return v, tea.Batch(v.runTurn(), waitAIEvent(v.events), func() tea.Msg {
-			_ = approved
-			return nil
-		})
+		v.thinkingShown = false
+		return v, tea.Batch(v.runTurn(), waitAIEvent(v.events), tickEvery())
 	case tea.KeyMsg:
 		return v.onKey(m)
 	}
@@ -216,19 +248,25 @@ func (v *aiView) onEvent(ev ai.Event) (view, tea.Cmd) {
 	switch ev.Kind {
 	case ai.EvtThinking:
 		v.state = aiThinking
-		v.appendKind(kindThinking, "AI is processing your request…")
-	case ai.EvtAssistant:
-		// Remove last thinking line if present
-		if len(v.lines) > 0 && v.lines[len(v.lines)-1].kind == kindThinking {
-			v.lines = v.lines[:len(v.lines)-1]
+		// Only show one thinking line per turn — avoid stacking duplicates.
+		if !v.thinkingShown {
+			v.thinkingShown = true
+			v.appendKind(kindThinking, "AI is processing your request…")
 		}
+	case ai.EvtAssistant:
+		// Replace the thinking placeholder with the actual response.
+		v.removeThinkingLines()
 		v.appendKind(kindAssistant, ev.Text)
 	case ai.EvtScanStart:
+		v.removeThinkingLines()
+		v.turnStats.scanned = true
 		v.appendKind(kindScan, "🔍 Scanning disk — discovering reclaimable artifacts…")
 	case ai.EvtScanDone:
 		if ev.Report != nil {
+			v.turnStats.findings = len(ev.Report.Findings)
+			v.turnStats.reclaimable = ev.Report.TotalBytes
 			v.appendKind(kindScan, fmt.Sprintf(
-				"✓ Scan complete — %d findings · %s reclaimable · %s free of %s",
+				"✓ Scan complete — %d findings · %s reclaimable · disk free %s of %s",
 				len(ev.Report.Findings),
 				humanize.IBytes(uint64(ev.Report.TotalBytes)),
 				humanize.IBytes(uint64(ev.Report.DiskFree)),
@@ -236,10 +274,12 @@ func (v *aiView) onEvent(ev ai.Event) (view, tea.Cmd) {
 			))
 		}
 	case ai.EvtProposal:
+		v.removeThinkingLines()
+		v.turnStats.proposed++
 		v.pending = ev.Action
 		v.state = aiAwaitApproval
 		v.scrollOffset = 0
-		// Don't add a chatLine for proposal — it renders as the approval panel
+		v.thinkingShown = false
 		if v.autoSafe && ev.Action.Risk == types.RiskSafe {
 			return v, v.approve()
 		}
@@ -260,8 +300,11 @@ func (v *aiView) onEvent(ev ai.Event) (view, tea.Cmd) {
 			}
 		}
 	case ai.EvtError:
+		v.removeThinkingLines()
+		v.thinkingShown = false
 		v.appendKind(kindError, "✗ Error: "+ev.Err.Error())
 		v.state = aiIdle
+		return v, nil // stop reading — turn is dead
 	}
 	return v, waitAIEvent(v.events)
 }
@@ -304,7 +347,17 @@ func (v *aiView) onKey(msg tea.KeyMsg) (view, tea.Cmd) {
 		v.appendKind(kindUser, text)
 		v.convo = append(v.convo, ai.Message{Role: "user", Content: text})
 		v.state = aiThinking
-		return v, tea.Batch(v.runTurn(), waitAIEvent(v.events))
+		v.thinkingShown = false
+		v.turnStats = struct {
+			scanned     bool
+			findings    int
+			reclaimable int64
+			proposed    int
+			approved    int
+			rejected    int
+			freed       int64
+		}{}
+		return v, tea.Batch(v.runTurn(), waitAIEvent(v.events), tickEvery())
 	case tea.KeyBackspace:
 		if n := len(v.input); n > 0 {
 			v.input = v.input[:n-1]
@@ -337,10 +390,12 @@ func (v *aiView) approve() tea.Cmd {
 func (v *aiView) reject() tea.Cmd {
 	action := v.pending
 	v.pending = nil
+	v.turnStats.rejected++
 	v.appendKind(kindSystem, fmt.Sprintf("✖ Rejected — skipping %s.", action.Category))
 	v.convo = append(v.convo, ai.FeedbackForModel(action, false, 0))
 	v.state = aiThinking
-	return tea.Batch(v.runTurn(), waitAIEvent(v.events))
+	v.thinkingShown = false
+	return tea.Batch(v.runTurn(), waitAIEvent(v.events), tickEvery())
 }
 
 func (v *aiView) cancelAgent() tea.Cmd {
@@ -349,8 +404,49 @@ func (v *aiView) cancelAgent() tea.Cmd {
 	}
 	v.pending = nil
 	v.state = aiIdle
-	v.appendKind(kindSystem, "Session cancelled.")
+	v.thinkingShown = false
+	v.removeThinkingLines()
+	v.appendKind(kindSystem, "Session cancelled — ready for a new question.")
 	return nil
+}
+
+// removeThinkingLines removes all thinking-placeholder lines from the chat log.
+// Called whenever the turn transitions away from the thinking state.
+func (v *aiView) removeThinkingLines() {
+	filtered := v.lines[:0]
+	for _, l := range v.lines {
+		if l.kind != kindThinking {
+			filtered = append(filtered, l)
+		}
+	}
+	v.lines = filtered
+}
+
+// appendTurnSummary adds a structured "what the AI did" block after the turn ends.
+func (v *aiView) appendTurnSummary() {
+	s := v.turnStats
+	// Only print a summary when something meaningful happened.
+	if !s.scanned && s.proposed == 0 && s.approved == 0 && s.rejected == 0 {
+		// Pure chat reply — no actions taken. No summary needed.
+		return
+	}
+	var parts []string
+	if s.scanned {
+		parts = append(parts, fmt.Sprintf("scanned disk · %d findings · %s reclaimable",
+			s.findings, humanize.IBytes(uint64(s.reclaimable))))
+	}
+	if s.proposed > 0 {
+		parts = append(parts, fmt.Sprintf("proposed %d cleanup action(s)", s.proposed))
+	}
+	if s.approved > 0 {
+		parts = append(parts, fmt.Sprintf("approved %d · freed %s",
+			s.approved, humanize.IBytes(uint64(s.freed))))
+	}
+	if s.rejected > 0 {
+		parts = append(parts, fmt.Sprintf("rejected %d", s.rejected))
+	}
+	summary := "─── Turn summary: " + strings.Join(parts, " · ") + " ───"
+	v.appendKind(kindSystem, summary)
 }
 
 func (v *aiView) runTurn() tea.Cmd {
@@ -430,11 +526,11 @@ func (v *aiView) viewWelcome(width, height int) string {
 		"  " + chipStyle.Render("Be aggressive — I haven't touched these in months"),
 		"",
 		sectionStyle.Render("How the AI process works"),
-		"  " + thinkBadgeStyle.Render(" THINK ") + "  " + dimStyle.Render("AI analyses your request"),
-		"  " + toolBadgeStyle.Render(" SCAN  ") + "  " + dimStyle.Render("Disk is scanned for artifacts"),
-		"  " + scanBadgeStyle.Render(" PROP  ") + "  " + dimStyle.Render("AI proposes a cleanup category"),
-		"  " + execBadgeStyle.Render(" EXEC  ") + "  " + dimStyle.Render("Files removed after your approval"),
-		"  " + doneBadgeStyle.Render(" DONE  ") + "  " + dimStyle.Render("Result reported back to AI"),
+		"  " + thinkBadgeStyle.Render("[ THINK ]") + "  " + dimStyle.Render("AI analyses your request"),
+		"  " + toolBadgeStyle.Render("[ SCAN  ]") + "  " + dimStyle.Render("Disk is scanned for artifacts"),
+		"  " + scanBadgeStyle.Render("[ PROP  ]") + "  " + dimStyle.Render("AI proposes a cleanup category"),
+		"  " + execBadgeStyle.Render("[ EXEC  ]") + "  " + dimStyle.Render("Files removed after your approval"),
+		"  " + doneBadgeStyle.Render("[ DONE  ]") + "  " + dimStyle.Render("Result reported back to AI"),
 		"",
 		sectionStyle.Render("Risk levels"),
 		"  " + riskChip("SAFE") + "  " + dimStyle.Render(riskBlurb("SAFE")),
@@ -507,24 +603,24 @@ func (v *aiView) formatLine(ln chatLine, width int) []string {
 	var badge string
 	switch ln.kind {
 	case kindUser:
-		badge = userBadgeStyle.Render(" you ")
+		badge = userBadgeStyle.Render("[ YOU   ]")
 	case kindAssistant:
-		badge = aiBadgeStyle.Render(" ai  ")
+		badge = aiBadgeStyle.Render("[ AI    ]")
 	case kindThinking:
 		spinner := thinkingSpinner()
-		badge = thinkBadgeStyle.Render(" " + spinner + " ")
+		badge = thinkBadgeStyle.Render("[ THINK ]") + " " + spinner
 	case kindTool:
-		badge = toolBadgeStyle.Render(" tool")
+		badge = toolBadgeStyle.Render("[ TOOL  ]")
 	case kindScan:
-		badge = scanBadgeStyle.Render(" scan")
+		badge = scanBadgeStyle.Render("[ SCAN  ]")
 	case kindExec:
-		badge = execBadgeStyle.Render(" exec")
+		badge = execBadgeStyle.Render("[ EXEC  ]")
 	case kindDone:
-		badge = doneBadgeStyle.Render(" done")
+		badge = doneBadgeStyle.Render("[ DONE  ]")
 	case kindError:
-		badge = errorBadgeStyle.Render(" err ")
+		badge = errorBadgeStyle.Render("[ ERROR ]")
 	default:
-		badge = systemBadgeStyle.Render("·")
+		badge = systemBadgeStyle.Render("[ SYS   ]")
 	}
 	prefix := badge + " "
 	indent := strings.Repeat(" ", lipgloss.Width(prefix))

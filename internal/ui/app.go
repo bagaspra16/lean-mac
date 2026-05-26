@@ -105,6 +105,12 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		v, cmd3 := a.help.Update(msg)
 		a.help = v
 		return a, tea.Batch(cmd1, cmd2, cmd3)
+	case tickMsg:
+		v, cmd1 := a.scan.Update(msg)
+		a.scan = v
+		v, cmd2 := a.ai.Update(msg)
+		a.ai = v
+		return a, tea.Batch(cmd1, cmd2)
 	case tea.KeyMsg:
 		if !a.activeWantsKey(msg) {
 			switch msg.String() {
