@@ -52,7 +52,7 @@ deletes them. SAFE-risk findings are always eligible; --aggressive includes MEDI
 					return nil
 				}
 			}
-			result := c.Clean(context.Background(), selected)
+			result := c.Clean(context.Background(), selected, nil)
 			if asJSON {
 				return reporting.CleanJSON(os.Stdout, result)
 			}

@@ -45,7 +45,9 @@ func (c *Cleaner) Eligible(f types.Finding) bool {
 }
 
 // Clean deletes (or simulates deleting) the given findings and returns a report.
-func (c *Cleaner) Clean(ctx context.Context, findings []types.Finding) *types.CleanReport {
+// If results is non-nil, each CleanResult is sent to it immediately as it completes,
+// enabling live progress updates in the UI. The channel is NOT closed by Clean.
+func (c *Cleaner) Clean(ctx context.Context, findings []types.Finding, results chan<- types.CleanResult) *types.CleanReport {
 	rpt := &types.CleanReport{StartedAt: time.Now(), DryRun: c.opt.DryRun}
 	if free, _, err := fsutil.DiskUsage("/"); err == nil {
 		rpt.DiskBefore = free
@@ -53,7 +55,7 @@ func (c *Cleaner) Clean(ctx context.Context, findings []types.Finding) *types.Cl
 	for _, f := range findings {
 		select {
 		case <-ctx.Done():
-			break
+			goto done
 		default:
 		}
 		res := c.cleanOne(ctx, f)
@@ -61,7 +63,11 @@ func (c *Cleaner) Clean(ctx context.Context, findings []types.Finding) *types.Cl
 		if res.Success {
 			rpt.BytesFreed += res.BytesFreed
 		}
+		if results != nil {
+			results <- res
+		}
 	}
+done:
 	if free, _, err := fsutil.DiskUsage("/"); err == nil {
 		rpt.DiskAfter = free
 	}

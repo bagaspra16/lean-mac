@@ -76,17 +76,21 @@ type aiView struct {
 
 	// turnStats tracks activity within the current AI turn for the summary.
 	turnStats struct {
-		scanned    bool
-		findings   int
+		scanned     bool
+		findings    int
 		reclaimable int64
-		proposed   int
-		approved   int
-		rejected   int
-		freed      int64
+		proposed    int
+		approved    int
+		rejected    int
+		freed       int64
+		execCount   int // items processed in current execution
 	}
 
 	// thinkingShown prevents duplicate "thinking" lines per turn.
 	thinkingShown bool
+
+	// execFreed accumulates bytes freed during the current execution phase.
+	execFreed int64
 
 	scrollOffset int // manual scroll in approval view
 	width, height int
@@ -237,6 +241,8 @@ func (v *aiView) Update(msg tea.Msg) (view, tea.Cmd) {
 		v.convo = append(v.convo, ai.FeedbackForModel(v.pending, true, m.freed))
 		v.removeThinkingLines() // remove the execution spinner
 		v.pending = nil
+		v.execFreed = 0
+		v.turnStats.execCount = 0
 		v.state = aiThinking
 		v.thinkingShown = false
 		return v, tea.Batch(v.runTurn(), waitAIEvent(v.events), tickEvery())
@@ -262,18 +268,32 @@ func (v *aiView) onEvent(ev ai.Event) (view, tea.Cmd) {
 	case ai.EvtScanStart:
 		v.removeThinkingLines()
 		v.turnStats.scanned = true
-		v.appendKind(kindScan, "🔍 Scanning disk — discovering reclaimable artifacts…")
+		v.appendKind(kindScan, "🔍 Scanning disk…")
+	case ai.EvtScanProgress:
+		// Update the last scan line in-place so it shows what category is being scanned.
+		for i := len(v.lines) - 1; i >= 0; i-- {
+			if v.lines[i].kind == kindScan {
+				v.lines[i].text = "🔍 Scanning: " + ev.Text + "…"
+				break
+			}
+		}
 	case ai.EvtScanDone:
 		if ev.Report != nil {
 			v.turnStats.findings = len(ev.Report.Findings)
 			v.turnStats.reclaimable = ev.Report.TotalBytes
-			v.appendKind(kindScan, fmt.Sprintf(
-				"✓ Scan complete — %d findings · %s reclaimable · disk free %s of %s",
-				len(ev.Report.Findings),
-				humanize.IBytes(uint64(ev.Report.TotalBytes)),
-				humanize.IBytes(uint64(ev.Report.DiskFree)),
-				humanize.IBytes(uint64(ev.Report.DiskTotal)),
-			))
+			// Update the scan line in-place with final result.
+			for i := len(v.lines) - 1; i >= 0; i-- {
+				if v.lines[i].kind == kindScan {
+					v.lines[i].text = fmt.Sprintf(
+						"✓ Scan complete — %d findings · %s reclaimable · disk free %s of %s",
+						len(ev.Report.Findings),
+						humanize.IBytes(uint64(ev.Report.TotalBytes)),
+						humanize.IBytes(uint64(ev.Report.DiskFree)),
+						humanize.IBytes(uint64(ev.Report.DiskTotal)),
+					)
+					break
+				}
+			}
 		}
 	case ai.EvtProposal:
 		v.removeThinkingLines()
@@ -287,11 +307,30 @@ func (v *aiView) onEvent(ev ai.Event) (view, tea.Cmd) {
 		}
 	case ai.EvtExecutionStart:
 		if ev.Action != nil {
-			v.appendKind(kindExec, fmt.Sprintf("⚙ Executing: %s (%d items)…",
-				ev.Action.Category, len(ev.Action.Findings)))
+			// Update the executing line in-place.
+			for i := len(v.lines) - 1; i >= 0; i-- {
+				if v.lines[i].kind == kindExecuting {
+					v.lines[i].text = fmt.Sprintf("Approved — executing %s… (0/%d done)",
+						ev.Action.Category, len(ev.Action.Findings))
+					break
+				}
+			}
 		}
 	case ai.EvtExecutionResult:
 		if ev.Result != nil {
+			// Accumulate freed bytes and item count live.
+			v.turnStats.execCount++
+			if ev.Result.Success {
+				v.execFreed += ev.Result.BytesFreed
+			}
+			// Update the executing spinner line in-place with progress.
+			for i := len(v.lines) - 1; i >= 0; i-- {
+				if v.lines[i].kind == kindExecuting {
+					v.lines[i].text = fmt.Sprintf("Executing… (%d done, %s freed so far)",
+						v.turnStats.execCount, humanize.IBytes(uint64(v.execFreed)))
+					break
+				}
+			}
 			if ev.Result.Success {
 				v.appendKind(kindDone, fmt.Sprintf("  ✓ %s  %s",
 					ev.Result.Finding.Path,
@@ -301,6 +340,10 @@ func (v *aiView) onEvent(ev ai.Event) (view, tea.Cmd) {
 					ev.Result.Finding.Path, ev.Result.Error))
 			}
 		}
+	case ai.EvtDone:
+		// Execution is fully complete — this is sent by Execute() after all items.
+		v.removeThinkingLines()
+		return v, func() tea.Msg { return aiExecDoneMsg{freed: v.execFreed} }
 	case ai.EvtError:
 		v.removeThinkingLines()
 		v.thinkingShown = false
@@ -358,7 +401,9 @@ func (v *aiView) onKey(msg tea.KeyMsg) (view, tea.Cmd) {
 			approved    int
 			rejected    int
 			freed       int64
+			execCount   int
 		}{}
+		v.execFreed = 0
 		return v, tea.Batch(v.runTurn(), waitAIEvent(v.events), tickEvery())
 	case tea.KeyBackspace:
 		if n := len(v.input); n > 0 {
@@ -377,16 +422,18 @@ func (v *aiView) onKey(msg tea.KeyMsg) (view, tea.Cmd) {
 func (v *aiView) approve() tea.Cmd {
 	action := v.pending
 	v.state = aiExecuting
-	v.appendKind(kindExecuting, fmt.Sprintf("Approved — executing %s…", action.Category))
+	v.execFreed = 0
+	v.turnStats.execCount = 0
+	v.appendKind(kindExecuting, fmt.Sprintf("Approved — executing %s… (starting)", action.Category))
 	dry := v.dryRun
 	events := v.events
-	
-	execCmd := func() tea.Msg {
-		ai.Execute(context.Background(), action, dry, events)
-		return aiExecDoneMsg{freed: action.Total}
-	}
-	
-	return tea.Batch(execCmd, tickEvery())
+
+	// Run Execute in a goroutine so it streams EvtExecutionResult events live
+	// into the existing events channel. The UI picks them up via waitAIEvent.
+	// When Execute finishes it sends EvtDone which triggers aiExecDoneMsg.
+	go ai.Execute(context.Background(), action, dry, events)
+
+	return tea.Batch(waitAIEvent(v.events), tickEvery())
 }
 
 func (v *aiView) reject() tea.Cmd {

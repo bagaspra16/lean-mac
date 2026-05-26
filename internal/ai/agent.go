@@ -54,6 +54,7 @@ const (
 	EvtThinking EventKind = iota
 	EvtAssistant
 	EvtScanStart
+	EvtScanProgress // live scan category update
 	EvtScanDone
 	EvtProposal
 	EvtExecutionStart
@@ -194,7 +195,13 @@ func (a *Agent) toolScan(ctx context.Context, tc ToolCall, out chan<- Event) Mes
 	ch := make(chan scanner.Progress, 64)
 	done := make(chan *types.ScanReport, 1)
 	go func() { done <- s.Run(ctx, ch) }()
-	for range ch {
+	// Forward progress ticks so the UI knows the scan is alive (one event per detector).
+	var lastDet string
+	for p := range ch {
+		if p.Detector != lastDet {
+			lastDet = p.Detector
+			out <- Event{Kind: EvtScanProgress, Text: p.Detector}
+		}
 	}
 	rpt := <-done
 	a.scan = rpt
@@ -253,8 +260,8 @@ func toolErr(tc ToolCall, msg string) Message {
 	}
 }
 
-// Execute runs a single approved action through the cleaner. The path-level
-// safety check inside the cleaner is the final line of defense.
+// Execute runs a single approved action through the cleaner. Results are streamed
+// live via the out channel (one EvtExecutionResult per item), then EvtDone.
 func Execute(ctx context.Context, action *Action, dryRun bool, out chan<- Event) {
 	if action == nil {
 		out <- Event{Kind: EvtError, Err: errors.New("nil action")}
@@ -266,10 +273,22 @@ func Execute(ctx context.Context, action *Action, dryRun bool, out chan<- Event)
 		Aggressive:       action.Risk >= types.RiskMedium,
 		IncludeDangerous: action.Risk == types.RiskDangerous,
 	})
-	rpt := c.Clean(ctx, action.Findings)
-	for i := range rpt.Results {
-		out <- Event{Kind: EvtExecutionResult, Result: &rpt.Results[i]}
+	// Buffer so cleaner never blocks even if the event loop is slightly behind.
+	resultCh := make(chan types.CleanResult, 32)
+	var rpt *types.CleanReport
+	done := make(chan struct{})
+	go func() {
+		rpt = c.Clean(ctx, action.Findings, resultCh)
+		close(resultCh)
+		close(done)
+	}()
+	for res := range resultCh {
+		r := res // avoid closure capture
+		out <- Event{Kind: EvtExecutionResult, Result: &r}
 	}
+	<-done
+	out <- Event{Kind: EvtDone}
+	_ = rpt
 }
 
 // FeedbackForModel turns user-approval results into a tool message the model

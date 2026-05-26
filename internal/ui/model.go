@@ -374,7 +374,7 @@ func (v *scanView) runClean() tea.Cmd {
 	dry := v.dryRun
 	return func() tea.Msg {
 		c := cleaner.New(cleaner.Options{DryRun: dry, Aggressive: true, IncludeDangerous: true})
-		return cleanDoneMsg{report: c.Clean(context.Background(), findings)}
+		return cleanDoneMsg{report: c.Clean(context.Background(), findings, nil)}
 	}
 }
 
